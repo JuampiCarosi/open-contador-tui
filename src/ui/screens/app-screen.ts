@@ -1,4 +1,12 @@
-import { BoxRenderable, TextRenderable, type KeyEvent, type RenderContext } from "@opentui/core";
+import {
+  BoxRenderable,
+  TextRenderable,
+  type KeyEvent,
+  type RenderContext,
+  StyledText,
+  fg,
+  type TextChunk,
+} from "@opentui/core";
 import type { Cliente, Factura } from "../../types";
 import { SosContadorClient, SosContadorClientError } from "../../services/sos-contador-client";
 import { calcularTotales, createEmptyDraft, draftFromFactura, type FacturaDraft } from "../state/invoice-draft";
@@ -22,13 +30,15 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     padding: 1,
     flexDirection: "column",
     onKeyDown: (key) => void onKeyDown(key),
+    backgroundColor: "#0d1117",
+    border: false,
   });
   root.focusable = true;
 
-  const title = new TextRenderable(ctx, { content: "" });
-  const helper = new TextRenderable(ctx, { content: "" });
-  const body = new TextRenderable(ctx, { content: "", flexGrow: 1 });
-  const status = new TextRenderable(ctx, { content: "" });
+  const title = new TextRenderable(ctx, { content: "", fg: "#2dd4bf" });
+  const helper = new TextRenderable(ctx, { content: "", fg: "#8b949e" });
+  const body = new TextRenderable(ctx, { content: "", flexGrow: 1, fg: "#e6edf3" });
+  const status = new TextRenderable(ctx, { content: "", fg: "#8b949e" });
 
   root.add(title);
   root.add(helper);
@@ -44,6 +54,10 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
   let clientes: Cliente[] = [];
   let invoiceCursor = 0;
   let loading = false;
+  let clientPickerActive = false;
+  let clientPickerCursor = 0;
+  let facturaDetalle: Factura | null = null;
+  let loadingDetalle = false;
 
   const inicioMenu = ["Nueva factura", "Listar facturas", "Sincronizar datos", "Salir"];
 
@@ -63,6 +77,19 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
     if (step === "cliente") {
       return [
+        {
+          key: "seleccionarCliente",
+          label: "Seleccionar de lista de clientes",
+          value: () => "",
+          action: () => {
+            if (clientes.length === 0) {
+              setStatus("No hay clientes. Sincronizá primero.");
+              return;
+            }
+            clientPickerActive = true;
+            clientPickerCursor = 0;
+          },
+        },
         { key: "cuit", label: "CUIT", value: () => draft.cliente.cuit, setValue: (v) => (draft.cliente.cuit = v) },
         {
           key: "razonSocial",
@@ -224,6 +251,22 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     status.content = `› ${message}`;
   }
 
+  async function loadFacturaDetalle() {
+    const sel = selectedFactura();
+    if (!sel) return;
+    loadingDetalle = true;
+    facturaDetalle = null;
+    render();
+    try {
+      facturaDetalle = (await client.obtenerFacturaDetalle(sel.id)) ?? sel;
+    } catch {
+      facturaDetalle = sel;
+    } finally {
+      loadingDetalle = false;
+      render();
+    }
+  }
+
   async function syncData() {
     loading = true;
     render();
@@ -235,79 +278,134 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       setStatus(message);
     } finally {
       loading = false;
+      render();
     }
   }
 
   function renderInicio() {
-    title.content = "╭─ SOS CONTADOR TERMINAL ─ estilo terminal.shop ─────────────────────────────╮";
+    title.content = "╭─ SOS CONTADOR TERMINAL ───────────────────────────────────────────────────╮";
     helper.content = "↑/↓ mover • Enter seleccionar • q salir";
-    body.content = inicioMenu
-      .map((item, i) => `${cursor === i ? "❯" : " "} ${item}`)
-      .join("\n");
+    const chunks: TextChunk[] = [];
+    inicioMenu.forEach((item, i) => {
+      const isSelected = cursor === i;
+      chunks.push(isSelected ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
+      chunks.push(isSelected ? fg("#e6edf3")(item) : fg("#8b949e")(item));
+      if (i < inicioMenu.length - 1) chunks.push(fg("#8b949e")("\n"));
+    });
+    body.content = new StyledText(chunks);
   }
 
   function renderFacturas() {
-    title.content = "╭─ FACTURAS EMITIDAS ──────────────────────────────────────────────────────────╮";
-    helper.content = "↑/↓ navegar • Enter repetir factura editable • Esc volver";
+    title.content = "╭─ FACTURA (consulta) ──────────────────────────────────────────────────────╮";
+    helper.content = "↑/↓ cambiar factura • Esc volver";
     if (!facturas.length) {
       body.content = "No hay facturas cargadas. Usa 'Sincronizar datos' en inicio.";
       return;
     }
 
-    const lines = facturas.slice(0, 12).map((f, i) => {
-      const mark = i === invoiceCursor ? "❯" : " ";
-      return `${mark} ${f.numero} | ${f.cliente.razonSocial} | ${f.cliente.cuit} | ${f.total.toFixed(2)}`;
+    const f = facturaDetalle ?? selectedFactura();
+    if (loadingDetalle || !f) {
+      body.content = loadingDetalle ? "Cargando detalle de la factura..." : "Seleccionando factura...";
+      return;
+    }
+
+    const chunks: TextChunk[] = [];
+    const sep = "────────────────────────────────────────────────────────────────";
+    const sep2 = "────────────────────────────────────────────────────────────────";
+
+    chunks.push(fg("#2dd4bf")("FACTURA\n\n"));
+    chunks.push(fg("#e6edf3")(`Nº ${f.numero}`));
+    chunks.push(fg("#8b949e")("  ".repeat(20)));
+    chunks.push(fg("#e6edf3")(`Fecha de emisión: ${f.fechaEmision}\n\n`));
+
+    chunks.push(fg("#2dd4bf")("CLIENTE\n"));
+    chunks.push(fg("#e6edf3")(`Razón social: ${f.cliente.razonSocial}\n`));
+    chunks.push(fg("#e6edf3")(`CUIT: ${f.cliente.cuit}\n`));
+    if (f.cliente.direccion) chunks.push(fg("#e6edf3")(`Dirección: ${f.cliente.direccion}\n`));
+    if (f.cliente.email) chunks.push(fg("#e6edf3")(`Email: ${f.cliente.email}\n`));
+    chunks.push(fg("#8b949e")("\n"));
+
+    chunks.push(fg("#2dd4bf")("DETALLE\n"));
+    chunks.push(fg("#8b949e")(`${sep}\n`));
+    chunks.push(fg("#8b949e")("Descripción".padEnd(32) + "Cant.".padStart(8) + "P.Unit".padStart(12) + "IVA%".padStart(6) + "Subtotal".padStart(12) + "\n"));
+    chunks.push(fg("#8b949e")(`${sep2}\n`));
+
+    f.items.forEach((it) => {
+      const neto = it.cantidad * it.precioUnitario;
+      const totalLinea = neto * (1 + (it.alicuotaIva || 0) / 100);
+      const desc = (it.descripcion || "(sin descripción)").slice(0, 30).padEnd(32);
+      const cant = it.cantidad.toFixed(2).padStart(8);
+      const pUnit = it.precioUnitario.toFixed(2).padStart(12);
+      const iva = (it.alicuotaIva ?? 21).toFixed(0).padStart(6);
+      const sub = (Number.isNaN(totalLinea) ? 0 : totalLinea).toFixed(2).padStart(12);
+      chunks.push(fg("#e6edf3")(`${desc}${cant}${pUnit}${iva}${sub}\n`));
     });
 
-    const selected = selectedFactura();
-    const detail = selected
-      ? [
-          "",
-          "Detalle:",
-          `Cliente: ${selected.cliente.razonSocial}`,
-          `CUIT: ${selected.cliente.cuit}`,
-          `Emisión: ${selected.fechaEmision}`,
-          `Items: ${selected.items.length}`,
-        ]
-      : [];
+    chunks.push(fg("#8b949e")(`${sep2}\n`));
+    chunks.push(fg("#e6edf3")(`Subtotal neto:`.padEnd(58) + f.subtotal.toFixed(2).padStart(12) + "\n"));
+    chunks.push(fg("#e6edf3")(`IVA:`.padEnd(58) + f.totalIva.toFixed(2).padStart(12) + "\n"));
+    chunks.push(fg("#2dd4bf")(`TOTAL:`.padEnd(58) + f.total.toFixed(2).padStart(12) + "\n"));
 
-    body.content = [...lines, ...detail].join("\n");
+    if (f.observaciones) {
+      chunks.push(fg("#8b949e")("\nObservaciones: "));
+      chunks.push(fg("#e6edf3")(`${f.observaciones}\n`));
+    }
+
+    chunks.push(fg("#8b949e")(`\nFactura ${invoiceCursor + 1} de ${facturas.length}`));
+
+    body.content = new StyledText(chunks);
   }
 
   function renderNueva() {
     const fields = getFields();
     const totals = calcularTotales(draft);
 
-    title.content = `╭─ NUEVA FACTURA (${step.toUpperCase()}) ────────────────────────────────────────╮`;
-    helper.content = "↑/↓ mover • Enter editar/accionar • Esc atrás • Tab sugerencias cliente";
+    title.content = `╭─ NUEVA FACTURA (${step.toUpperCase()}) ───────────────────────────────────────────╮`;
+    helper.content = clientPickerActive
+      ? "↑/↓ elegir cliente • Enter seleccionar • Esc cancelar"
+      : "↑/↓ mover • Enter editar/accionar • Esc atrás • Tab sugerencias cliente";
 
-    const list = fields.map((f, i) => {
-      const prefix = cursor === i ? (editing && f.setValue ? "✎" : "❯") : " ";
-      if (f.action && !f.setValue) return `${prefix} [ ${f.label} ]`;
-      return `${prefix} ${f.label}: ${f.value()}`;
+    const chunks: TextChunk[] = [];
+    fields.forEach((f, i) => {
+      const isSelected = cursor === i;
+      const prefix = isSelected ? (editing && f.setValue ? "✎" : "❯") : " ";
+      chunks.push(isSelected ? fg("#2dd4bf")(prefix + " ") : fg("#8b949e")(prefix + " "));
+      if (f.action && !f.setValue) {
+        chunks.push(isSelected ? fg("#e6edf3")(`[ ${f.label} ]`) : fg("#8b949e")(`[ ${f.label} ]`));
+      } else {
+        chunks.push(isSelected ? fg("#e6edf3")(`${f.label}: ${f.value()}`) : fg("#8b949e")(`${f.label}: ${f.value()}`));
+      }
+      chunks.push(fg("#8b949e")("\n"));
     });
 
-    if (step === "cliente" && draft.cliente.cuit) {
+    if (step === "cliente" && clientPickerActive) {
+      chunks.push(fg("#2dd4bf")("\n▼ Seleccioná un cliente (↑/↓ Enter para elegir, Esc cancelar):\n"));
+      clientes.slice(0, 10).forEach((c, i) => {
+        const sel = i === clientPickerCursor;
+        chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
+        chunks.push(sel ? fg("#e6edf3")(`${c.cuit} | ${c.razonSocial}\n`) : fg("#8b949e")(`${c.cuit} | ${c.razonSocial}\n`));
+      });
+    } else if (step === "cliente" && draft.cliente.cuit) {
       const sugerencias = clientSuggestions(draft.cliente.cuit);
       if (sugerencias.length) {
-        list.push("", "Clientes sugeridos:");
-        sugerencias.forEach((c) => list.push(`  - ${c.cuit} | ${c.razonSocial}`));
+        chunks.push(fg("#8b949e")("\nClientes sugeridos (Tab para autocompletar):\n"));
+        sugerencias.forEach((c) => chunks.push(fg("#e6edf3")(`  - ${c.cuit} | ${c.razonSocial}\n`)));
       }
     }
 
-    list.push(
-      "",
-      `Subtotal: ${totals.subtotal.toFixed(2)}  IVA: ${totals.totalIva.toFixed(2)}  Total: ${totals.total.toFixed(2)}`,
+    chunks.push(
+      fg("#8b949e")("\n"),
+      fg("#e6edf3")(`Subtotal: ${totals.subtotal.toFixed(2)}  IVA: ${totals.totalIva.toFixed(2)}  Total: ${totals.total.toFixed(2)}`),
     );
 
     if (step === "items" && draft.items.length) {
-      list.push("", "Items actuales:");
+      chunks.push(fg("#8b949e")("\n\nItems actuales:\n"));
       draft.items.forEach((it, index) => {
-        list.push(`  ${index + 1}. ${it.descripcion} | ${it.cantidad} x ${it.precioUnitario}`);
+        chunks.push(fg("#e6edf3")(`  ${index + 1}. ${it.descripcion} | ${it.cantidad} x ${it.precioUnitario}\n`));
       });
     }
 
-    body.content = list.join("\n");
+    body.content = new StyledText(chunks);
   }
 
   function render() {
@@ -348,6 +446,8 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         } else if (selected === "Listar facturas") {
           view = "facturas";
           invoiceCursor = 0;
+          facturaDetalle = null;
+          void loadFacturaDetalle();
         } else if (selected === "Sincronizar datos") {
           await syncData();
         } else {
@@ -364,14 +464,26 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         cursor = 0;
       } else if (key.name === "down" && facturas.length) {
         invoiceCursor = (invoiceCursor + 1) % facturas.length;
+        void loadFacturaDetalle();
       } else if (key.name === "up" && facturas.length) {
         invoiceCursor = (invoiceCursor - 1 + facturas.length) % facturas.length;
-      } else if ((key.name === "enter" || key.name === "return") && selectedFactura()) {
-        draft = draftFromFactura(selectedFactura()!);
-        view = "nueva";
-        step = "cliente";
-        cursor = 0;
-        setStatus(`Repitiendo factura ${selectedFactura()!.numero}. Editá antes de emitir.`);
+        void loadFacturaDetalle();
+      }
+      render();
+      return;
+    }
+
+    if (clientPickerActive && step === "cliente") {
+      if (key.name === "escape") {
+        clientPickerActive = false;
+      } else if (key.name === "down" && clientes.length) {
+        clientPickerCursor = (clientPickerCursor + 1) % Math.min(clientes.length, 10);
+      } else if (key.name === "up" && clientes.length) {
+        clientPickerCursor = (clientPickerCursor - 1 + Math.min(clientes.length, 10)) % Math.min(clientes.length, 10);
+      } else if ((key.name === "enter" || key.name === "return") && clientes[clientPickerCursor]) {
+        draft.cliente = { ...clientes[clientPickerCursor]! };
+        clientPickerActive = false;
+        setStatus(`Cliente seleccionado: ${draft.cliente.razonSocial}`);
       }
       render();
       return;
@@ -392,7 +504,9 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     if (key.name === "up") cursor = (cursor - 1 + fields.length) % fields.length;
 
     if (key.name === "escape") {
-      if (step === "cliente") {
+      if (clientPickerActive) {
+        clientPickerActive = false;
+      } else if (step === "cliente") {
         view = "inicio";
         cursor = 0;
       } else if (step === "items") {
@@ -425,5 +539,6 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
   void syncData();
   render();
+  root.focus();
   return root;
 }

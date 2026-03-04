@@ -2,7 +2,7 @@ import type { Cliente, Factura } from "../types";
 import type { FacturaDraft } from "../ui/state/invoice-draft";
 
 interface AuthPayload {
-  email: string;
+  usuario: string;
   password: string;
 }
 
@@ -14,19 +14,90 @@ interface ApiErrorBody {
 
 export class SosContadorClientError extends Error {}
 
+function unwrapArray<T>(response: unknown): T[] {
+  if (Array.isArray(response)) return response as T[];
+  if (response && typeof response === "object") {
+    for (const val of Object.values(response)) {
+      if (Array.isArray(val)) return val as T[];
+    }
+  }
+  return [];
+}
+
+function mapVentaToFactura(v: Record<string, unknown>): Factura {
+  const cab = (v.cabecera ?? v) as Record<string, unknown>;
+  const id = String(cab.id ?? v.id ?? cab.idcomprobante ?? "");
+  const pv = cab.puntoventa != null ? String(cab.puntoventa) : "";
+  const num = cab.numero != null ? String(cab.numero) : "";
+  const numero = pv && num ? `${pv.padStart(3, "0")}-${num.padStart(8, "0")}` : String(v.numero ?? num ? num : id);
+  const fechaRaw = cab.fecha ?? v.fecha ?? cab.fecha_emision ?? "";
+  const fechaEmision = typeof fechaRaw === "string" ? fechaRaw.slice(0, 10) : String(fechaRaw);
+
+  const clienteRaw = (cab.cliente ?? cab) as Record<string, unknown>;
+  const cliente = {
+    id: clienteRaw.idclipro != null ? String(clienteRaw.idclipro) : clienteRaw.id != null ? String(clienteRaw.id) : undefined,
+    cuit: String(clienteRaw.cuit ?? cab.cuit ?? clienteRaw.identificacion ?? ""),
+    razonSocial: String(clienteRaw.razon_social ?? clienteRaw.razonsocial ?? cab.clipro ?? clienteRaw.clipro ?? cab.clipro ?? clienteRaw.nombre ?? ""),
+    email: (clienteRaw.email ?? cab.email) != null ? String(clienteRaw.email ?? cab.email) : undefined,
+    direccion: (clienteRaw.direccion ?? cab.domicilio ?? clienteRaw.domicilio) != null ? String(clienteRaw.direccion ?? cab.domicilio ?? clienteRaw.domicilio) : undefined,
+    telefono: (clienteRaw.telefono ?? cab.telefono) != null ? String(clienteRaw.telefono ?? cab.telefono) : undefined,
+  };
+
+  const productosRaw = (v.productos ?? v.items ?? []) as Array<Record<string, unknown>>;
+  const items = productosRaw.map((it) => {
+    const cant = Number(it.cantidad ?? it.fc ?? it.c ?? it.qty ?? 1);
+    const precio = Number(it.unitario ?? it.precio_unitario ?? it.fu ?? it.p ?? it.precio ?? 0);
+    const monto = Number(it.monto ?? it.v ?? it.importe ?? it.montohaber ?? it.subtotal ?? cant * precio);
+    const precioUnit = precio > 0 ? precio : cant > 0 ? monto / cant : monto;
+    return {
+      descripcion: String(it.producto ?? it.producto_impresion ?? it.descripcion ?? it.d ?? it.concepto ?? it.desc ?? it.memo ?? ""),
+      cantidad: cant,
+      precioUnitario: precioUnit,
+      alicuotaIva: Number(it.alicuota ?? it.alicuota_iva ?? it.fa ?? it.a ?? 21),
+    };
+  });
+
+  const imputaciones = (v.imputaciones ?? []) as Array<Record<string, unknown>>;
+  let subtotal = Number(v.subtotal ?? v.neto ?? cab.subtotal ?? 0);
+  let totalIva = Number(v.total_iva ?? v.iva ?? cab.iva ?? 0);
+  let total = Number(v.total ?? v.importe ?? cab.total ?? 0);
+  if (total === 0 && imputaciones.length > 0) {
+    total = imputaciones.reduce((sum, i) => sum + Number(i.montohaber ?? i.montodebe ?? i.v ?? 0), 0);
+  }
+  if (subtotal === 0 && totalIva === 0 && items.length > 0) {
+    subtotal = items.reduce((s, it) => s + it.cantidad * it.precioUnitario, 0);
+    totalIva = items.reduce((s, it) => s + it.cantidad * it.precioUnitario * ((it.alicuotaIva || 0) / 100), 0);
+    if (total === 0) total = subtotal + totalIva;
+  }
+  return {
+    id,
+    numero,
+    fechaEmision,
+    cliente,
+    items,
+    subtotal,
+    totalIva,
+    total,
+    estado: "emitida",
+  };
+}
+
 export class SosContadorClient {
-  private token?: string;
+  private jwt?: string;
+  private jwtc?: string;
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly retries: number;
   private readonly auth?: AuthPayload;
+  private readonly cuitId?: string;
 
   constructor() {
     this.baseUrl = (process.env.SOS_CONTADOR_BASE_URL ?? "").trim();
-    this.token = process.env.SOS_CONTADOR_API_TOKEN;
-    const email = process.env.SOS_CONTADOR_EMAIL;
+    this.jwt = process.env.SOS_CONTADOR_API_TOKEN;
+    const usuario = process.env.SOS_CONTADOR_EMAIL;
     const password = process.env.SOS_CONTADOR_PASSWORD;
-    this.auth = email && password ? { email, password } : undefined;
+    this.auth = usuario && password ? { usuario, password } : undefined;
+    this.cuitId = process.env.SOS_CONTADOR_CUIT_ID;
     this.timeoutMs = Number.parseInt(process.env.SOS_CONTADOR_TIMEOUT_MS ?? "9000", 10);
     this.retries = Number.parseInt(process.env.SOS_CONTADOR_RETRIES ?? "2", 10);
   }
@@ -35,33 +106,105 @@ export class SosContadorClient {
     return Boolean(this.baseUrl);
   }
 
-  async authenticate() {
-    if (this.token) return this.token;
+  private async authenticateUser(): Promise<string> {
+    if (this.jwt) return this.jwt;
     if (!this.baseUrl || !this.auth) {
       throw new SosContadorClientError("Falta configurar credenciales de SOS Contador.");
     }
 
-    const resp = await this.request<{ access_token: string }>("/auth/login", {
+    const resp = await this.request<{ jwt: string }>("/login", {
       method: "POST",
       body: JSON.stringify(this.auth),
-      requiresAuth: false,
+      authMode: "none",
     });
-    this.token = resp.access_token;
-    return this.token;
+    this.jwt = resp.jwt;
+    return this.jwt;
   }
 
-  async listarFacturas(): Promise<Factura[]> {
-    if (!this.baseUrl) return [];
-    return this.request<Factura[]>("/facturas", { method: "GET" });
+  async authenticate() {
+    if (this.jwtc) return this.jwtc;
+
+    await this.authenticateUser();
+
+    let idcuit = this.cuitId;
+    if (!idcuit) {
+      const cuits = await this.request<Array<{ id: number; cuit: string; razonsocial: string }>>(
+        "/cuit/listado",
+        { method: "GET", authMode: "jwt" },
+      );
+      const list = Array.isArray(cuits) ? cuits : unwrapArray<{ id: number }>(cuits);
+      if (!list.length) {
+        throw new SosContadorClientError("No se encontró ninguna CUIT asociada al usuario.");
+      }
+      idcuit = String(list[0]!.id);
+    }
+
+    const resp = await this.request<{ jwt: string }>(
+      `/cuit/credentials/${idcuit}`,
+      { method: "GET", authMode: "jwt" },
+    );
+    this.jwtc = resp.jwt;
+    return this.jwtc;
   }
 
-  async listarClientes(): Promise<Cliente[]> {
+  async listarFacturas(
+    modo = "T",
+    periodo = "anio",
+    cae = "T",
+    pagina = 1,
+    registros = 100,
+  ): Promise<Factura[]> {
     if (!this.baseUrl) return [];
-    const raw = await this.request<Array<Record<string, string>>>("/clientes", { method: "GET" });
+    const hoy = new Date();
+    const hace2Anios = new Date(hoy);
+    hace2Anios.setFullYear(hoy.getFullYear() - 2);
+    const fechaDesde = hace2Anios.toISOString().slice(0, 10);
+    const fechaHasta = hoy.toISOString().slice(0, 10);
+
+    const listadoResp = await this.request<unknown>(
+      `/venta/listado/${modo}/${periodo}/${cae}?pagina=${pagina}&registros=${registros}&fecha_desde=${fechaDesde}&fecha_hasta=${fechaHasta}`,
+      { method: "GET" },
+    );
+    let raw = unwrapArray<Record<string, unknown>>(listadoResp);
+
+    if (raw.length === 0) {
+      const consultaResp = await this.request<unknown>(`/venta/consulta?pagina=${pagina}&registros=${registros}`, {
+        method: "POST",
+        body: JSON.stringify({ fecha_desde: fechaDesde, fecha_hasta: fechaHasta }),
+      });
+      raw = unwrapArray<Record<string, unknown>>(consultaResp);
+    }
+
+    return raw.map((v) => mapVentaToFactura(v));
+  }
+
+  async obtenerFacturaDetalle(id: string): Promise<Factura | null> {
+    if (!this.baseUrl || !id) return null;
+    try {
+      const resp = await this.request<Record<string, unknown>>(`/venta/detalle/${id}`, { method: "GET" });
+      return mapVentaToFactura(resp);
+    } catch {
+      return null;
+    }
+  }
+
+  async listarClientes(pagina = 1, registros = 50): Promise<Cliente[]> {
+    if (!this.baseUrl) return [];
+    const params = new URLSearchParams({
+      proveedor: "true",
+      cliente: "true",
+      pagina: String(pagina),
+      registros: String(registros),
+    });
+    const resp = await this.request<unknown>(
+      `/cliente/listado?${params}`,
+      { method: "GET" },
+    );
+    const raw = unwrapArray<Record<string, string>>(resp);
     return raw.map((it) => ({
       id: it.id,
       cuit: it.cuit ?? it.identificacion ?? "",
-      razonSocial: it.razon_social ?? it.razonSocial ?? it.nombre ?? "",
+      razonSocial: it.razon_social ?? it.razonSocial ?? it.clipro ?? it.nombre ?? "",
       email: it.email,
       direccion: it.direccion,
       telefono: it.telefono,
@@ -79,24 +222,30 @@ export class SosContadorClient {
       throw new SosContadorClientError("SOS_CONTADOR_BASE_URL no está configurado.");
     }
 
-    return this.request<Factura>("/facturas", {
-      method: "POST",
+    const idPath = draft.idOrigen ? `/${draft.idOrigen}` : "";
+
+    return this.request<Factura>(`/venta${idPath}`, {
+      method: "PUT",
       body: JSON.stringify({
-        cliente: {
-          cuit: draft.cliente.cuit,
-          razon_social: draft.cliente.razonSocial,
-          email: draft.cliente.email,
-          direccion: draft.cliente.direccion,
-          telefono: draft.cliente.telefono,
-        },
-        fecha_emision: draft.fechaEmision,
-        fecha_vencimiento: draft.fechaVencimiento,
-        observaciones: draft.observaciones,
-        items: draft.items.map((item) => ({
-          descripcion: item.descripcion,
-          cantidad: item.cantidad,
-          precio_unitario: item.precioUnitario,
-          alicuota_iva: item.alicuotaIva,
+        fecha: draft.fechaEmision,
+        idclipro: draft.cliente.id ? Number(draft.cliente.id) : undefined,
+        cuitclipro: draft.cliente.cuit,
+        fcncnd: "F",
+        letra: "C",
+        puntoventa: 1,
+        obtienecae: false,
+        memo: draft.observaciones,
+        imputaciones: draft.items.map((item) => ({
+          i: "neto",
+          a: item.alicuotaIva,
+          v: item.cantidad * item.precioUnitario,
+        })),
+        productos: draft.items.map((item) => ({
+          id: 0,
+          u: 7,
+          fc: item.cantidad,
+          fu: item.precioUnitario,
+          fa: item.alicuotaIva,
         })),
       }),
     });
@@ -104,9 +253,13 @@ export class SosContadorClient {
 
   private async request<T>(
     path: string,
-    init: RequestInit & { requiresAuth?: boolean } = {},
+    init: RequestInit & { authMode?: "none" | "jwt" | "jwtc" } = {},
   ): Promise<T> {
-    if (init.requiresAuth !== false) await this.authenticate();
+    const authMode = init.authMode ?? "jwtc";
+    if (authMode === "jwtc") await this.authenticate();
+    else if (authMode === "jwt") await this.authenticateUser();
+
+    const token = authMode === "jwt" ? this.jwt : authMode === "jwtc" ? this.jwtc : undefined;
 
     let attempt = 0;
     while (attempt <= this.retries) {
@@ -118,7 +271,7 @@ export class SosContadorClient {
           signal: controller.signal,
           headers: {
             "Content-Type": "application/json",
-            ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
             ...(init.headers ?? {}),
           },
         });
@@ -144,7 +297,10 @@ export class SosContadorClient {
           continue;
         }
         if (error instanceof SosContadorClientError) throw error;
-        throw new SosContadorClientError("No se pudo conectar a SOS Contador.");
+        console.error(error);
+        throw new SosContadorClientError(
+          `No se pudo conectar a SOS Contador. ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
       }
     }
 
