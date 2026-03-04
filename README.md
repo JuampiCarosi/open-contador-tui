@@ -30,6 +30,22 @@ bun run start
 bun run typecheck
 ```
 
+## Configuración de entorno
+
+Copia el archivo de ejemplo y completa tus credenciales:
+
+```bash
+cp .env.example .env
+```
+
+Variables disponibles:
+
+- `SOS_CONTADOR_BASE_URL`: URL base de la API.
+- `SOS_CONTADOR_API_TOKEN`: token Bearer (si ya lo tienes).
+- `SOS_CONTADOR_EMAIL` y `SOS_CONTADOR_PASSWORD`: credenciales para `authenticate()` si no hay token.
+- `SOS_CONTADOR_TIMEOUT_MS`: timeout por request en milisegundos.
+- `SOS_CONTADOR_RETRIES`: reintentos para errores transitorios (timeouts, 429 y 5xx).
+
 ## Estructura
 
 ```txt
