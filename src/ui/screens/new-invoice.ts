@@ -1,4 +1,5 @@
 import { BoxRenderable, TextRenderable, type KeyEvent, type RenderContext } from "@opentui/core";
+import { validateInvoice, validateInvoiceStep, validatePendingItem } from "../../domain/validation/invoice";
 import { createHeader } from "../components/header";
 import { createInvoiceDraftStore } from "../state/invoice-draft";
 
@@ -21,6 +22,8 @@ export function createNewInvoiceScreen(
   let selectedIndex = 0;
   let isEditing = false;
   let statusMessage = "Completa los datos y avanza con Enter.";
+  let fieldErrors: Record<string, string[]> = {};
+  let confirmErrors: string[] = [];
 
   const screen = new BoxRenderable(ctx, {
     width: "100%",
@@ -165,23 +168,100 @@ export function createNewInvoiceScreen(
   }
 
   function handleAction(fieldKey: string) {
+    const state = store.getState();
+
     switch (fieldKey) {
       case "action-add": {
+        const result = validatePendingItem(state.pendingItem);
+        if (result.issues.some((issue) => issue.critical)) {
+          fieldErrors = toFieldErrors(result.issues);
+          statusMessage = "No se pudo agregar el ítem. Revisa los campos marcados.";
+          break;
+        }
+
         const added = store.addPendingItem();
+        fieldErrors = {};
         statusMessage = added ? "Ítem agregado." : "Debes escribir una descripción para agregar ítem.";
         break;
       }
-      case "action-next":
+      case "action-next": {
+        const validation = validateInvoiceStep(state, state.currentStep);
+        const criticalIssues = validation.issues.filter((issue) => issue.critical && issue.step === state.currentStep);
+
+        if (criticalIssues.length > 0) {
+          fieldErrors = toFieldErrors(criticalIssues);
+          statusMessage = "Corrige los errores críticos antes de continuar.";
+          break;
+        }
+
+        fieldErrors = {};
         store.nextStep();
         selectedIndex = 0;
+        statusMessage = "Paso completado.";
         break;
-      case "action-confirm":
-        store.markConfirmed();
-        statusMessage = "Factura confirmada en memoria. Presiona Escape para volver.";
+      }
+      case "action-confirm": {
+        const validation = validateInvoice(state);
+        const criticalIssues = validation.issues.filter((issue) => issue.critical);
+        if (criticalIssues.length > 0) {
+          fieldErrors = toFieldErrors(criticalIssues);
+          confirmErrors = criticalIssues.map((issue) => issue.message);
+          statusMessage = "No se puede confirmar. Revisa el resumen de errores.";
+          break;
+        }
+
+        fieldErrors = {};
+        confirmErrors = [];
+        const created = createInvoice();
+        statusMessage = created
+          ? "Factura confirmada en memoria. Presiona Escape para volver."
+          : "No se pudo crear la factura por inconsistencias de estado.";
         break;
+      }
       default:
         break;
     }
+  }
+
+  function createInvoice(): boolean {
+    const validation = validateInvoice(store.getState());
+    if (validation.issues.some((issue) => issue.critical)) {
+      return false;
+    }
+
+    store.markConfirmed();
+    return true;
+  }
+
+  function toFieldErrors(issues: { field: string; message: string }[]) {
+    const nextErrors: Record<string, string[]> = {};
+    for (const issue of issues) {
+      const errors = nextErrors[issue.field] ?? [];
+      errors.push(issue.message);
+      nextErrors[issue.field] = errors;
+    }
+    return nextErrors;
+  }
+
+  function findFieldErrors(_stateStep: number, fieldKey: string): string[] {
+    const mapping: Record<string, string> = {
+      nombre: "client.nombre",
+      identificacion: "client.identificacion",
+      email: "client.email",
+      descripcion: "pendingItem.descripcion",
+      cantidad: "pendingItem.cantidad",
+      precio: "pendingItem.precio",
+      impuestos: "pendingItem.impuestos",
+      fecha: "meta.fecha",
+      vencimiento: "meta.vencimiento",
+    };
+
+    const fieldPath = mapping[fieldKey];
+    if (!fieldPath) {
+      return [];
+    }
+
+    return fieldErrors[fieldPath] ?? [];
   }
 
   function render() {
@@ -212,6 +292,12 @@ export function createNewInvoiceScreen(
       if (state.items.length === 0) {
         lines.push("  (sin ítems)");
       }
+
+      if (confirmErrors.length > 0) {
+        lines.push("");
+        lines.push("Errores al confirmar:");
+        confirmErrors.forEach((error) => lines.push(`  - ${error}`));
+      }
       lines.push("");
     } else if (state.currentStep === 2) {
       lines.push(`Ítems cargados: ${state.items.length}`);
@@ -229,6 +315,11 @@ export function createNewInvoiceScreen(
       } else {
         lines.push(`${activePointer} ${field.label}: ${value}`);
       }
+
+      const errors = findFieldErrors(state.currentStep, field.key);
+      errors.forEach((error) => {
+        lines.push(`    ⚠ ${error}`);
+      });
     });
 
     if (state.currentStep > 1) {
