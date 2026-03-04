@@ -40,6 +40,7 @@ bun run typecheck
 - `SOS_CONTADOR_BASE_URL` URL base de API (obligatoria para emitir/listar real).
 - `SOS_CONTADOR_API_TOKEN` token Bearer.
 - `SOS_CONTADOR_EMAIL` y `SOS_CONTADOR_PASSWORD` (alternativa para login).
+- `SOS_CONTADOR_PUNTO_VENTA` punto de venta fallback para emitir cuando no hay historial (default: `1`).
 - `SOS_CONTADOR_TIMEOUT_MS` timeout HTTP.
 - `SOS_CONTADOR_RETRIES` reintentos.
 

@@ -2,6 +2,7 @@ import type { Cliente, Factura, ItemFactura } from "../../types";
 
 export interface FacturaDraft {
   idOrigen?: string;
+  puntoVenta: number;
   cliente: Cliente;
   fechaEmision: string;
   fechaVencimiento: string;
@@ -19,9 +20,10 @@ export function emptyItem(): ItemFactura {
   };
 }
 
-export function createEmptyDraft(): FacturaDraft {
+export function createEmptyDraft(puntoVenta = 1): FacturaDraft {
   const today = new Date().toISOString().slice(0, 10);
   return {
+    puntoVenta,
     cliente: {
       cuit: "",
       razonSocial: "",
@@ -40,6 +42,7 @@ export function createEmptyDraft(): FacturaDraft {
 export function draftFromFactura(factura: Factura): FacturaDraft {
   return {
     idOrigen: factura.id,
+    puntoVenta: factura.puntoVenta ?? 1,
     cliente: { ...factura.cliente },
     fechaEmision: factura.fechaEmision,
     fechaVencimiento: factura.fechaVencimiento ?? factura.fechaEmision,

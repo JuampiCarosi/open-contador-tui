@@ -13,6 +13,7 @@ export interface Factura {
   totalIva: number;
   total: number;
   estado: "borrador" | "emitida" | "anulada";
+  puntoVenta?: number;
   /** CAE número (Código de Autorización Electrónico) */
   caeNumero?: string;
   /** CAE vencimiento */

@@ -56,6 +56,8 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
   const pv = cab.puntoventa != null ? String(cab.puntoventa) : "";
   const num = cab.numero != null ? String(cab.numero) : "";
   const numero = pv && num ? `${pv.padStart(3, "0")}-${num.padStart(8, "0")}` : String(v.numero ?? num ? num : id);
+  const puntoVentaFromNumero = numero.match(/^(\d{1,5})-/)?.[1];
+  const puntoVenta = pv ? Number.parseInt(pv, 10) : puntoVentaFromNumero ? Number.parseInt(puntoVentaFromNumero, 10) : undefined;
   const fechaRaw = cab.fecha ?? v.fecha ?? cab.fecha_emision ?? "";
   const fechaEmision = typeof fechaRaw === "string" ? fechaRaw.slice(0, 10) : String(fechaRaw);
 
@@ -136,6 +138,7 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
     totalIva,
     total,
     estado: "emitida",
+    puntoVenta: Number.isInteger(puntoVenta) && (puntoVenta ?? 0) > 0 ? puntoVenta : undefined,
     caeNumero,
     caeVencimiento,
   };
@@ -147,6 +150,7 @@ export class SosContadorClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly retries: number;
+  private readonly puntoVenta: number;
   private readonly auth?: AuthPayload;
   private readonly cuitId?: string;
 
@@ -159,6 +163,8 @@ export class SosContadorClient {
     this.cuitId = process.env.SOS_CONTADOR_CUIT_ID;
     this.timeoutMs = Number.parseInt(process.env.SOS_CONTADOR_TIMEOUT_MS ?? "9000", 10);
     this.retries = Number.parseInt(process.env.SOS_CONTADOR_RETRIES ?? "2", 10);
+    const puntoVenta = Number.parseInt(process.env.SOS_CONTADOR_PUNTO_VENTA ?? "1", 10);
+    this.puntoVenta = Number.isInteger(puntoVenta) && puntoVenta > 0 ? puntoVenta : 1;
   }
 
   isConfigured() {
@@ -335,7 +341,7 @@ export class SosContadorClient {
         cuitclipro: draft.cliente.cuit,
         fcncnd: "F",
         letra: "C",
-        puntoventa: 1,
+        puntoventa: draft.puntoVenta > 0 ? draft.puntoVenta : this.puntoVenta,
         obtienecae: false,
         memo: draft.observaciones,
         imputaciones: draft.items.map((item) => ({

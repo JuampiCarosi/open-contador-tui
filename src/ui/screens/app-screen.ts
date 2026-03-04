@@ -92,6 +92,17 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       .slice(0, 4);
   }
 
+  function getMayorPuntoVentaDisponible() {
+    const fromFacturas = facturas
+      .map((f) => f.puntoVenta)
+      .filter((pv): pv is number => typeof pv === "number" && Number.isInteger(pv) && pv > 0);
+    if (fromFacturas.length > 0) {
+      return Math.max(...fromFacturas);
+    }
+    const fromEnv = Number.parseInt(process.env.SOS_CONTADOR_PUNTO_VENTA ?? "1", 10);
+    return Number.isInteger(fromEnv) && fromEnv > 0 ? fromEnv : 1;
+  }
+
   function getFields(): Field[] {
     if (view !== "nueva") return [];
 
@@ -117,7 +128,12 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           value: () => draft.cliente.razonSocial,
           setValue: (v) => (draft.cliente.razonSocial = v),
         },
-        { key: "email", label: "Email", value: () => draft.cliente.email ?? "", setValue: (v) => (draft.cliente.email = v) },
+        {
+          key: "email",
+          label: "Email",
+          value: () => draft.cliente.email ?? "",
+          setValue: (v) => (draft.cliente.email = v),
+        },
         {
           key: "direccion",
           label: "Dirección",
@@ -162,10 +178,30 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       if (itemEditIndex != null && editingItem) {
         return [
           [
-            { key: "descripcion", label: "Descripción", value: () => editingItem.descripcion, setValue: (v: string) => (editingItem.descripcion = v) },
-            { key: "cantidad", label: "Cantidad", value: () => String(editingItem.cantidad), setValue: (v: string) => (editingItem.cantidad = Number.parseFloat(v) || 0) },
-            { key: "precio", label: "Precio unitario", value: () => String(editingItem.precioUnitario), setValue: (v: string) => (editingItem.precioUnitario = Number.parseFloat(v) || 0) },
-            { key: "iva", label: "Alicuota IVA %", value: () => String(editingItem.alicuotaIva), setValue: (v: string) => (editingItem.alicuotaIva = Number.parseFloat(v) || 0) },
+            {
+              key: "descripcion",
+              label: "Descripción",
+              value: () => editingItem.descripcion,
+              setValue: (v: string) => (editingItem.descripcion = v),
+            },
+            {
+              key: "cantidad",
+              label: "Cantidad",
+              value: () => String(editingItem.cantidad),
+              setValue: (v: string) => (editingItem.cantidad = Number.parseFloat(v) || 0),
+            },
+            {
+              key: "precio",
+              label: "Precio unitario",
+              value: () => String(editingItem.precioUnitario),
+              setValue: (v: string) => (editingItem.precioUnitario = Number.parseFloat(v) || 0),
+            },
+            {
+              key: "iva",
+              label: "Alicuota IVA %",
+              value: () => String(editingItem.alicuotaIva),
+              setValue: (v: string) => (editingItem.alicuotaIva = Number.parseFloat(v) || 0),
+            },
             {
               key: "guardar",
               label: "Guardar cambios",
@@ -251,7 +287,11 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           label: "Agregar ítem",
           value: () => "",
           action: () => {
-            if (!draft.itemPendiente.descripcion || draft.itemPendiente.cantidad <= 0 || draft.itemPendiente.precioUnitario <= 0) {
+            if (
+              !draft.itemPendiente.descripcion ||
+              draft.itemPendiente.cantidad <= 0 ||
+              draft.itemPendiente.precioUnitario <= 0
+            ) {
               setStatus("Completa descripción, cantidad y precio (>0).");
               return;
             }
@@ -279,6 +319,15 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     if (step === "detalle") {
       return [
         {
+          key: "puntoVenta",
+          label: "Punto de venta",
+          value: () => String(draft.puntoVenta),
+          setValue: (v) => {
+            const pv = Number.parseInt(v, 10);
+            draft.puntoVenta = Number.isInteger(pv) && pv > 0 ? pv : 1;
+          },
+        },
+        {
           key: "fechaEmision",
           label: "Fecha emisión",
           value: () => draft.fechaEmision,
@@ -301,6 +350,10 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           label: "Ver vista previa",
           value: () => "",
           action: () => {
+            if (!Number.isInteger(draft.puntoVenta) || draft.puntoVenta <= 0) {
+              setStatus("El punto de venta debe ser un entero mayor a 0.");
+              return;
+            }
             step = "confirmar";
             cursor = 0;
           },
@@ -315,21 +368,22 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           label: "Confirmar y emitir",
           value: () => "",
           action: async () => {
-          loading = true;
-          render();
-          try {
-            const created = await client.crearFacturaDesdeDraft(draft);
-            facturaRecienEmitida = created;
-            setStatus(`Factura ${created.numero} emitida correctamente. [e] Enviar por mail`);
-            draft = createEmptyDraft();
-            step = "cliente";
-            view = "inicio";
-          } catch (error) {
-            const message = error instanceof SosContadorClientError ? error.message : "Error desconocido al emitir factura.";
-            setStatus(message);
-          } finally {
-            loading = false;
-          }
+            loading = true;
+            render();
+            try {
+              const created = await client.crearFacturaDesdeDraft(draft);
+              facturaRecienEmitida = created;
+              setStatus(`Factura ${created.numero} emitida correctamente. [e] Enviar por mail`);
+              draft = createEmptyDraft();
+              step = "cliente";
+              view = "inicio";
+            } catch (error) {
+              const message =
+                error instanceof SosContadorClientError ? error.message : "Error desconocido al emitir factura.";
+              setStatus(message);
+            } finally {
+              loading = false;
+            }
           },
         },
         {
@@ -431,7 +485,11 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       const sel = i === invoiceCursor;
       const color = sel ? fg("#e6edf3") : fg("#8b949e");
       chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
-      chunks.push(color(`${f.numero.padEnd(14)} ${f.fechaEmision}  ${f.cliente.razonSocial.slice(0, 35).padEnd(35)} $${formatMonto(f.total)}\n`));
+      chunks.push(
+        color(
+          `${f.numero.padEnd(14)} ${f.fechaEmision}  ${f.cliente.razonSocial.slice(0, 35).padEnd(35)} $${formatMonto(f.total)}\n`,
+        ),
+      );
     });
     chunks.push(fg("#8b949e")("\n"));
     chunks.push(fg("#8b949e")(`${invoiceCursor + 1} de ${facturas.length}`));
@@ -476,14 +534,27 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
     chunks.push(fg("#2dd4bf")("DETALLE\n"));
     chunks.push(fg("#8b949e")(`${sep}\n`));
-    chunks.push(fg("#8b949e")("Descripción".padEnd(32) + "Cant.".padStart(10) + "P.Unit".padStart(14) + "IVA%".padStart(6) + "Subtotal".padStart(14) + "\n"));
+    chunks.push(
+      fg("#8b949e")(
+        "Descripción".padEnd(32) +
+          "Cant.".padStart(10) +
+          "P.Unit".padStart(14) +
+          "IVA%".padStart(6) +
+          "Subtotal".padStart(14) +
+          "\n",
+      ),
+    );
     chunks.push(fg("#8b949e")(`${sep2}\n`));
 
     f.items.forEach((it) => {
       const neto = it.cantidad * it.precioUnitario;
       const totalLinea = neto * (1 + (it.alicuotaIva || 0) / 100);
       const desc = (it.descripcion || "(sin descripción)").slice(0, 30).padEnd(32);
-      chunks.push(fg("#e6edf3")(`${desc}${formatMontoPad(it.cantidad, 10)}${formatMontoPad(it.precioUnitario, 14)}${String(it.alicuotaIva ?? 21).padStart(6)}${formatMontoPad(Number.isNaN(totalLinea) ? 0 : totalLinea, 14)}\n`));
+      chunks.push(
+        fg("#e6edf3")(
+          `${desc}${formatMontoPad(it.cantidad, 10)}${formatMontoPad(it.precioUnitario, 14)}${String(it.alicuotaIva ?? 21).padStart(6)}${formatMontoPad(Number.isNaN(totalLinea) ? 0 : totalLinea, 14)}\n`,
+        ),
+      );
     });
 
     chunks.push(fg("#8b949e")(`${sep2}\n`));
@@ -568,6 +639,7 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       const sep = "────────────────────────────────────────────────────────────────";
       const chunks: TextChunk[] = [];
       chunks.push(fg("#2dd4bf")("FACTURA (borrador)\n\n"));
+      chunks.push(fg("#e6edf3")(`Punto de venta: ${draft.puntoVenta}\n`));
       chunks.push(fg("#e6edf3")(`Fecha: ${draft.fechaEmision}\n\n`));
       chunks.push(fg("#2dd4bf")("CLIENTE\n"));
       chunks.push(fg("#e6edf3")(`Razón social: ${draft.cliente.razonSocial}\n`));
@@ -576,19 +648,33 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       chunks.push(fg("#8b949e")("\n"));
       chunks.push(fg("#2dd4bf")("DETALLE\n"));
       chunks.push(fg("#8b949e")(`${sep}\n`));
-      chunks.push(fg("#8b949e")("Descripción".padEnd(32) + "Cant.".padStart(10) + "P.Unit".padStart(14) + "IVA%".padStart(6) + "Subtotal".padStart(14) + "\n"));
+      chunks.push(
+        fg("#8b949e")(
+          "Descripción".padEnd(32) +
+            "Cant.".padStart(10) +
+            "P.Unit".padStart(14) +
+            "IVA%".padStart(6) +
+            "Subtotal".padStart(14) +
+            "\n",
+        ),
+      );
       chunks.push(fg("#8b949e")(`${sep}\n`));
       draft.items.forEach((it) => {
         const neto = it.cantidad * it.precioUnitario;
         const totalLinea = neto * (1 + (it.alicuotaIva || 0) / 100);
         const desc = (it.descripcion || "(sin descripción)").slice(0, 30).padEnd(32);
-        chunks.push(fg("#e6edf3")(`${desc}${formatMontoPad(it.cantidad, 10)}${formatMontoPad(it.precioUnitario, 14)}${String(it.alicuotaIva ?? 21).padStart(6)}${formatMontoPad(Number.isNaN(totalLinea) ? 0 : totalLinea, 14)}\n`));
+        chunks.push(
+          fg("#e6edf3")(
+            `${desc}${formatMontoPad(it.cantidad, 10)}${formatMontoPad(it.precioUnitario, 14)}${String(it.alicuotaIva ?? 21).padStart(6)}${formatMontoPad(Number.isNaN(totalLinea) ? 0 : totalLinea, 14)}\n`,
+          ),
+        );
       });
       chunks.push(fg("#8b949e")(`${sep}\n`));
       chunks.push(fg("#e6edf3")(`Subtotal neto:`.padEnd(58) + formatMontoPad(totals.subtotal, 14) + "\n"));
       chunks.push(fg("#e6edf3")(`IVA:`.padEnd(58) + formatMontoPad(totals.totalIva, 14) + "\n"));
       chunks.push(fg("#2dd4bf")(`TOTAL:`.padEnd(58) + formatMontoPad(totals.total, 14) + "\n"));
-      if (draft.observaciones) chunks.push(fg("#8b949e")("\nObservaciones: "), fg("#e6edf3")(`${draft.observaciones}\n`));
+      if (draft.observaciones)
+        chunks.push(fg("#8b949e")("\nObservaciones: "), fg("#e6edf3")(`${draft.observaciones}\n`));
       const confFields = getFields();
       const confCursor = Math.min(cursor, confFields.length - 1);
       chunks.push(fg("#8b949e")("\n"));
@@ -627,7 +713,9 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       clientes.slice(0, 10).forEach((c, i) => {
         const sel = i === clientPickerCursor;
         chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
-        chunks.push(sel ? fg("#e6edf3")(`${c.cuit} | ${c.razonSocial}\n`) : fg("#8b949e")(`${c.cuit} | ${c.razonSocial}\n`));
+        chunks.push(
+          sel ? fg("#e6edf3")(`${c.cuit} | ${c.razonSocial}\n`) : fg("#8b949e")(`${c.cuit} | ${c.razonSocial}\n`),
+        );
       });
     } else if (step === "items" && productPickerActive) {
       chunks.push(fg("#2dd4bf")("\n▼ Seleccioná un producto (↑/↓ Enter para agregar, Esc cancelar):\n"));
@@ -635,7 +723,11 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         const sel = i === productPickerCursor;
         const color = sel ? fg("#e6edf3") : fg("#8b949e");
         chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
-        chunks.push(color(`${(p.descripcion || p.codigo || "").slice(0, 35).padEnd(35)} $${formatMonto(p.precioUnitario)} IVA ${p.alicuotaIva}%\n`));
+        chunks.push(
+          color(
+            `${(p.descripcion || p.codigo || "").slice(0, 35).padEnd(35)} $${formatMonto(p.precioUnitario)} IVA ${p.alicuotaIva}%\n`,
+          ),
+        );
       });
     } else if (step === "cliente" && draft.cliente.cuit) {
       const sugerencias = clientSuggestions(draft.cliente.cuit);
@@ -647,13 +739,19 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
     chunks.push(
       fg("#8b949e")("\n"),
-      fg("#e6edf3")(`Subtotal: ${formatMonto(totals.subtotal)}  IVA: ${formatMonto(totals.totalIva)}  Total: ${formatMonto(totals.total)}`),
+      fg("#e6edf3")(
+        `Subtotal: ${formatMonto(totals.subtotal)}  IVA: ${formatMonto(totals.totalIva)}  Total: ${formatMonto(totals.total)}`,
+      ),
     );
 
     if (step === "items" && draft.items.length) {
       chunks.push(fg("#8b949e")("\n\nItems actuales:\n"));
       draft.items.forEach((it, index) => {
-        chunks.push(fg("#e6edf3")(`  ${index + 1}. ${it.descripcion} | ${formatMonto(it.cantidad)} x ${formatMonto(it.precioUnitario)}\n`));
+        chunks.push(
+          fg("#e6edf3")(
+            `  ${index + 1}. ${it.descripcion} | ${formatMonto(it.cantidad)} x ${formatMonto(it.precioUnitario)}\n`,
+          ),
+        );
       });
     }
 
@@ -695,7 +793,8 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     if (!field.setValue) return;
     const current = field.value();
     if (key.name === "backspace") field.setValue(current.slice(0, -1));
-    else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) field.setValue(current + key.sequence);
+    else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta)
+      field.setValue(current + key.sequence);
   }
 
   async function onKeyDown(key: KeyEvent) {
@@ -723,7 +822,7 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         if (selected === "Nueva factura") {
           view = "nueva";
           step = "cliente";
-          draft = createEmptyDraft();
+          draft = createEmptyDraft(getMayorPuntoVentaDisponible());
           cursor = 0;
         } else if (selected === "Listar facturas") {
           view = "facturas";
@@ -779,8 +878,9 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           emailEnviando = true;
           render();
           try {
+            const idCliente = ctx.factura.cliente.id;
             for (const email of emails) {
-              await client.enviarFacturaPorEmail(ctx.factura.id, ctx.factura.cliente.id, email);
+              await client.enviarFacturaPorEmail(ctx.factura.id, idCliente, email);
             }
             setStatus(`Factura enviada a ${emails.join(", ")}`);
             if (ctx.source === "inicio") facturaRecienEmitida = null;
@@ -860,7 +960,8 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       } else if (key.name === "down" && productos.length) {
         productPickerCursor = (productPickerCursor + 1) % Math.min(productos.length, 12);
       } else if (key.name === "up" && productos.length) {
-        productPickerCursor = (productPickerCursor - 1 + Math.min(productos.length, 12)) % Math.min(productos.length, 12);
+        productPickerCursor =
+          (productPickerCursor - 1 + Math.min(productos.length, 12)) % Math.min(productos.length, 12);
       } else if ((key.name === "enter" || key.name === "return") && productos[productPickerCursor]) {
         const p = productos[productPickerCursor]!;
         draft.items.push({
