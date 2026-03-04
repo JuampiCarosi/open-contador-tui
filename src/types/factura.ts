@@ -1,16 +1,16 @@
 import type { Cliente } from "./cliente";
-import type { Impuesto } from "./impuesto";
 import type { ItemFactura } from "./item-factura";
 
 export interface Factura {
   id: string;
   numero: string;
   fechaEmision: string;
+  fechaVencimiento?: string;
   cliente: Cliente;
   items: ItemFactura[];
-  impuestos: Impuesto[];
+  observaciones?: string;
   subtotal: number;
-  totalImpuestos: number;
+  totalIva: number;
   total: number;
   estado: "borrador" | "emitida" | "anulada";
 }

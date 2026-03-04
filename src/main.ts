@@ -1,17 +1,13 @@
 import { BoxRenderable, createCliRenderer, type KeyEvent } from "@opentui/core";
-import { createHomeScreen } from "./ui/screens/home-screen";
+import { createAppScreen } from "./ui/screens/app-screen";
 
-const renderer = await createCliRenderer({
-  useMouse: false,
-  exitOnCtrlC: true,
-});
+const renderer = await createCliRenderer({ useMouse: false, exitOnCtrlC: true });
 
 const rootView = new BoxRenderable(renderer, {
   width: "100%",
   height: "100%",
-  flexDirection: "column",
   onKeyDown: (key: KeyEvent) => {
-    if (key.name === "q") {
+    if (key.name === "q" && (key.ctrl || key.meta)) {
       renderer.destroy();
       process.exit(0);
     }
@@ -20,5 +16,5 @@ const rootView = new BoxRenderable(renderer, {
 
 rootView.focusable = true;
 rootView.focus();
-rootView.add(createHomeScreen(renderer));
+rootView.add(createAppScreen(renderer));
 renderer.root.add(rootView);

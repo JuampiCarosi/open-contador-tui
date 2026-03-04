@@ -1,108 +1,64 @@
-export interface InvoiceClientData {
-  nombre: string;
-  identificacion: string;
-  email: string;
+import type { Cliente, Factura, ItemFactura } from "../../types";
+
+export interface FacturaDraft {
+  idOrigen?: string;
+  cliente: Cliente;
+  fechaEmision: string;
+  fechaVencimiento: string;
+  observaciones: string;
+  items: ItemFactura[];
+  itemPendiente: ItemFactura;
 }
 
-export interface InvoiceItemData {
-  descripcion: string;
-  cantidad: number;
-  precio: number;
-  impuestos: number;
-}
-
-export interface InvoiceMetaData {
-  fecha: string;
-  vencimiento: string;
-  notas: string;
-}
-
-export interface InvoiceDraftState {
-  currentStep: number;
-  client: InvoiceClientData;
-  items: InvoiceItemData[];
-  pendingItem: InvoiceItemData;
-  meta: InvoiceMetaData;
-  confirmed: boolean;
-}
-
-function createEmptyItem(): InvoiceItemData {
+export function emptyItem(): ItemFactura {
   return {
     descripcion: "",
     cantidad: 1,
-    precio: 0,
-    impuestos: 0,
+    precioUnitario: 0,
+    alicuotaIva: 21,
   };
 }
 
-export function createInvoiceDraftStore(initial?: Partial<InvoiceDraftState>) {
-  const state: InvoiceDraftState = {
-    currentStep: 1,
-    client: {
-      nombre: "",
-      identificacion: "",
+export function createEmptyDraft(): FacturaDraft {
+  const today = new Date().toISOString().slice(0, 10);
+  return {
+    cliente: {
+      cuit: "",
+      razonSocial: "",
       email: "",
+      direccion: "",
+      telefono: "",
     },
+    fechaEmision: today,
+    fechaVencimiento: today,
+    observaciones: "",
     items: [],
-    pendingItem: createEmptyItem(),
-    meta: {
-      fecha: "",
-      vencimiento: "",
-      notas: "",
-    },
-    confirmed: false,
-    ...initial,
+    itemPendiente: emptyItem(),
   };
+}
+
+export function draftFromFactura(factura: Factura): FacturaDraft {
+  return {
+    idOrigen: factura.id,
+    cliente: { ...factura.cliente },
+    fechaEmision: factura.fechaEmision,
+    fechaVencimiento: factura.fechaVencimiento ?? factura.fechaEmision,
+    observaciones: factura.observaciones ?? "",
+    items: factura.items.map((item) => ({ ...item })),
+    itemPendiente: emptyItem(),
+  };
+}
+
+export function calcularTotales(draft: FacturaDraft) {
+  const subtotal = draft.items.reduce((acc, item) => acc + item.cantidad * item.precioUnitario, 0);
+  const totalIva = draft.items.reduce(
+    (acc, item) => acc + item.cantidad * item.precioUnitario * (item.alicuotaIva / 100),
+    0,
+  );
 
   return {
-    getState: () => state,
-    nextStep: () => {
-      state.currentStep = Math.min(4, state.currentStep + 1);
-    },
-    previousStep: () => {
-      state.currentStep = Math.max(1, state.currentStep - 1);
-    },
-    setCurrentStep: (step: number) => {
-      state.currentStep = Math.max(1, Math.min(4, step));
-    },
-    updateClient: (patch: Partial<InvoiceClientData>) => {
-      state.client = { ...state.client, ...patch };
-    },
-    updateMeta: (patch: Partial<InvoiceMetaData>) => {
-      state.meta = { ...state.meta, ...patch };
-    },
-    updatePendingItem: (patch: Partial<InvoiceItemData>) => {
-      state.pendingItem = { ...state.pendingItem, ...patch };
-    },
-    addPendingItem: () => {
-      if (!state.pendingItem.descripcion.trim()) {
-        return false;
-      }
-
-      state.items.push({ ...state.pendingItem });
-      state.pendingItem = createEmptyItem();
-      return true;
-    },
-    removeLastItem: () => {
-      state.items.pop();
-    },
-    markConfirmed: () => {
-      state.confirmed = true;
-    },
-    getTotals: () => {
-      const subtotal = state.items.reduce((acc, item) => acc + item.cantidad * item.precio, 0);
-      const impuestos = state.items.reduce(
-        (acc, item) => acc + item.cantidad * item.precio * (item.impuestos / 100),
-        0,
-      );
-
-      return {
-        subtotal,
-        impuestos,
-        total: subtotal + impuestos,
-      };
-    },
+    subtotal,
+    totalIva,
+    total: subtotal + totalIva,
   };
 }
-
-export type InvoiceDraftStore = ReturnType<typeof createInvoiceDraftStore>;
