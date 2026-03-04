@@ -4,6 +4,7 @@ import {
   type KeyEvent,
   type RenderContext,
   StyledText,
+  bg,
   fg,
   type TextChunk,
 } from "@opentui/core";
@@ -18,7 +19,16 @@ function formatMontoPad(n: number, width: number): string {
   return formatMonto(n).padStart(width);
 }
 import { SosContadorClient, SosContadorClientError } from "../../services/sos-contador-client";
-import { calcularTotales, createEmptyDraft, draftFromFactura, type FacturaDraft } from "../state/invoice-draft";
+import { DolarMepClient, DolarMepClientError } from "../../services/dolar-mep-client";
+import {
+  calcularTotales,
+  convertUsdToArs,
+  createEmptyDraft,
+  draftFromFactura,
+  emptyItem,
+  isCotizacionStale,
+  type FacturaDraft,
+} from "../state/invoice-draft";
 
 type View = "inicio" | "nueva" | "facturas" | "facturaDetalle" | "posicionFiscal";
 type Step = "cliente" | "items" | "detalle" | "confirmar";
@@ -33,6 +43,7 @@ interface Field {
 
 export function createAppScreen(ctx: RenderContext): BoxRenderable {
   const client = new SosContadorClient();
+  const dolarMepClient = new DolarMepClient();
   const root = new BoxRenderable(ctx, {
     width: "100%",
     height: "100%",
@@ -57,7 +68,8 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
   let view: View = "inicio";
   let step: Step = "cliente";
   let cursor = 0;
-  let editing = false;
+  let inputCursor = 0;
+  let selectionAnchor: number | null = null;
   let draft: FacturaDraft = createEmptyDraft();
   let facturas: Factura[] = [];
   let clientes: Cliente[] = [];
@@ -74,7 +86,6 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
   let loadingPosicion = false;
   let emailEnviando = false;
   let facturaRecienEmitida: Factura | null = null;
-  let itemEditIndex: number | null = null;
   let emailInputActive = false;
   let emailInputValue = "";
   let emailInputContext: { factura: Factura; source: "detalle" | "inicio" } | null = null;
@@ -101,6 +112,52 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     }
     const fromEnv = Number.parseInt(process.env.SOS_CONTADOR_PUNTO_VENTA ?? "1", 10);
     return Number.isInteger(fromEnv) && fromEnv > 0 ? fromEnv : 1;
+  }
+
+  function clampInputCursor(value: string) {
+    inputCursor = Math.max(0, Math.min(inputCursor, value.length));
+  }
+
+  function setInputFocusToField(field?: Field) {
+    if (!field?.setValue) {
+      selectionAnchor = null;
+      return;
+    }
+    const value = field.value();
+    inputCursor = value.length;
+    selectionAnchor = null;
+  }
+
+  function getSelectionRange(value: string): { start: number; end: number } | null {
+    clampInputCursor(value);
+    if (selectionAnchor == null) return null;
+    const anchor = Math.max(0, Math.min(selectionAnchor, value.length));
+    if (anchor === inputCursor) return null;
+    return { start: Math.min(anchor, inputCursor), end: Math.max(anchor, inputCursor) };
+  }
+
+  function moveCursor(value: string, next: number, keepSelection: boolean) {
+    const prev = inputCursor;
+    inputCursor = Math.max(0, Math.min(next, value.length));
+    if (keepSelection) {
+      if (selectionAnchor == null) selectionAnchor = prev;
+    } else {
+      selectionAnchor = null;
+    }
+  }
+
+  function moveWordLeft(value: string, from: number) {
+    let i = Math.max(0, Math.min(from, value.length));
+    while (i > 0 && /\s/.test(value[i - 1]!)) i -= 1;
+    while (i > 0 && !/\s/.test(value[i - 1]!)) i -= 1;
+    return i;
+  }
+
+  function moveWordRight(value: string, from: number) {
+    let i = Math.max(0, Math.min(from, value.length));
+    while (i < value.length && /\s/.test(value[i]!)) i += 1;
+    while (i < value.length && !/\s/.test(value[i]!)) i += 1;
+    return i;
   }
 
   function getFields(): Field[] {
@@ -165,77 +222,104 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
             }
             step = "items";
             cursor = 0;
-            itemEditIndex = null;
           },
         },
       ];
     }
 
     if (step === "items") {
-      const editingItem = itemEditIndex != null ? draft.items[itemEditIndex] : null;
-      const target = editingItem ?? draft.itemPendiente;
+      const target = draft.itemPendiente;
+      const maxAgeMinutes = Number.parseInt(process.env.DOLAR_MEP_MAX_AGE_MINUTES ?? "180", 10);
+      const maxAge = Number.isFinite(maxAgeMinutes) ? maxAgeMinutes : 180;
 
-      if (itemEditIndex != null && editingItem) {
+      const refreshCotizacionMep = async (forceRefresh = false) => {
+        try {
+          const quote = await dolarMepClient.obtenerMep({ forceRefresh });
+          draft.cotizacionMep = {
+            compra: quote.compra,
+            venta: quote.venta,
+            fechaActualizacion: quote.fechaActualizacion,
+            fetchedAt: quote.fetchedAt,
+          };
+          if (quote.isStale) {
+            setStatus("Cotización MEP desactualizada. Refrescá antes de usar USD.");
+            return;
+          }
+          setStatus(`Cotización MEP ${quote.fromCache ? "cargada" : "actualizada"}: compra ${formatMonto(quote.compra)}.`);
+        } catch (error) {
+          const message = error instanceof DolarMepClientError ? error.message : "No se pudo obtener cotización MEP.";
+          setStatus(message);
+        }
+      };
+
+      const compraMep = draft.cotizacionMep?.compra;
+      const itemInlineFields: Field[] = draft.items.flatMap((it, i) => {
+        const precioUsd = compraMep && compraMep > 0 ? it.precioUnitario / compraMep : 0;
         return [
-          [
-            {
-              key: "descripcion",
-              label: "Descripción",
-              value: () => editingItem.descripcion,
-              setValue: (v: string) => (editingItem.descripcion = v),
+          {
+            key: `item${i}-descripcion`,
+            label: `Item ${i + 1} descripción`,
+            value: () => it.descripcion,
+            setValue: (v: string) => (it.descripcion = v),
+          },
+          {
+            key: `item${i}-cantidad`,
+            label: `Item ${i + 1} cantidad`,
+            value: () => String(it.cantidad),
+            setValue: (v: string) => (it.cantidad = Number.parseFloat(v.replace(",", ".")) || 0),
+          },
+          {
+            key: `item${i}-precio`,
+            label: `Item ${i + 1} precio (${draft.modoCargaMoneda})`,
+            value: () => String(draft.modoCargaMoneda === "USD" ? precioUsd : it.precioUnitario),
+            setValue: (v: string) => {
+              const n = Number.parseFloat(v.replace(",", ".")) || 0;
+              if (draft.modoCargaMoneda === "USD") {
+                if (!compraMep || compraMep <= 0) return;
+                it.precioUnitario = convertUsdToArs(n, compraMep);
+                return;
+              }
+              it.precioUnitario = n;
             },
-            {
-              key: "cantidad",
-              label: "Cantidad",
-              value: () => String(editingItem.cantidad),
-              setValue: (v: string) => (editingItem.cantidad = Number.parseFloat(v) || 0),
+          },
+          {
+            key: `item${i}-iva`,
+            label: `Item ${i + 1} IVA %`,
+            value: () => String(it.alicuotaIva),
+            setValue: (v: string) => (it.alicuotaIva = Number.parseFloat(v.replace(",", ".")) || 0),
+          },
+          {
+            key: `item${i}-remove`,
+            label: `Eliminar item ${i + 1}`,
+            value: () => "",
+            action: () => {
+              draft.items.splice(i, 1);
+              setStatus(`Item ${i + 1} eliminado.`);
             },
-            {
-              key: "precio",
-              label: "Precio unitario",
-              value: () => String(editingItem.precioUnitario),
-              setValue: (v: string) => (editingItem.precioUnitario = Number.parseFloat(v) || 0),
-            },
-            {
-              key: "iva",
-              label: "Alicuota IVA %",
-              value: () => String(editingItem.alicuotaIva),
-              setValue: (v: string) => (editingItem.alicuotaIva = Number.parseFloat(v) || 0),
-            },
-            {
-              key: "guardar",
-              label: "Guardar cambios",
-              value: () => "",
-              action: () => {
-                itemEditIndex = null;
-                setStatus("Cambios guardados.");
-              },
-            },
-            {
-              key: "eliminar",
-              label: "Eliminar ítem",
-              value: () => "",
-              action: () => {
-                draft.items.splice(itemEditIndex!, 1);
-                itemEditIndex = null;
-                setStatus("Ítem eliminado.");
-              },
-            },
-          ],
-        ].flat();
-      }
-
-      const itemFields: Field[] = draft.items.map((it, i) => ({
-        key: `item${i}`,
-        label: `Ítem ${i + 1}: ${it.descripcion.slice(0, 25)} | ${it.cantidad} x ${it.precioUnitario}`,
-        value: () => "",
-        action: () => {
-          itemEditIndex = i;
-          cursor = 0;
-        },
-      }));
+          },
+        ];
+      });
 
       return [
+        {
+          key: "monedaCarga",
+          label: `Moneda de carga: ${draft.modoCargaMoneda}`,
+          value: () => "",
+          action: async () => {
+            draft.modoCargaMoneda = draft.modoCargaMoneda === "ARS" ? "USD" : "ARS";
+            setStatus(`Modo de carga cambiado a ${draft.modoCargaMoneda}.`);
+            if (draft.modoCargaMoneda === "USD" && !draft.cotizacionMep) await refreshCotizacionMep();
+          },
+        },
+        {
+          key: "refreshMep",
+          label: "Refrescar cotización MEP",
+          value: () => "",
+          action: async () => {
+            await refreshCotizacionMep(true);
+          },
+        },
+        ...itemInlineFields,
         {
           key: "seleccionarProducto",
           label: "Seleccionar de inventario",
@@ -257,46 +341,66 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
             productPickerCursor = 0;
           },
         },
-        ...itemFields,
         {
-          key: "descripcion",
-          label: "Descripción",
+          key: "nuevo-descripcion",
+          label: "Nuevo ítem descripción",
           value: () => target.descripcion,
           setValue: (v) => (target.descripcion = v),
         },
         {
-          key: "cantidad",
-          label: "Cantidad",
+          key: "nuevo-cantidad",
+          label: "Nuevo ítem cantidad",
           value: () => String(target.cantidad),
-          setValue: (v) => (target.cantidad = Number.parseFloat(v) || 0),
+          setValue: (v) => (target.cantidad = Number.parseFloat(v.replace(",", ".")) || 0),
         },
         {
-          key: "precio",
-          label: "Precio unitario",
-          value: () => String(target.precioUnitario),
-          setValue: (v) => (target.precioUnitario = Number.parseFloat(v) || 0),
+          key: "nuevo-precio",
+          label: draft.modoCargaMoneda === "USD" ? "Nuevo ítem precio (USD)" : "Nuevo ítem precio",
+          value: () => {
+            if (draft.modoCargaMoneda === "USD") {
+              if (!compraMep || compraMep <= 0) return "";
+              return String(target.precioUnitario / compraMep);
+            }
+            return String(target.precioUnitario);
+          },
+          setValue: (v) => {
+            const n = Number.parseFloat(v.replace(",", ".")) || 0;
+            if (draft.modoCargaMoneda === "USD") {
+              if (!compraMep || compraMep <= 0) return;
+              target.precioUnitario = convertUsdToArs(n, compraMep);
+              return;
+            }
+            target.precioUnitario = n;
+          },
         },
         {
-          key: "iva",
-          label: "Alicuota IVA %",
+          key: "nuevo-iva",
+          label: "Nuevo ítem IVA %",
           value: () => String(target.alicuotaIva),
-          setValue: (v) => (target.alicuotaIva = Number.parseFloat(v) || 0),
+          setValue: (v) => (target.alicuotaIva = Number.parseFloat(v.replace(",", ".")) || 0),
         },
         {
           key: "add",
           label: "Agregar ítem",
           value: () => "",
           action: () => {
-            if (
-              !draft.itemPendiente.descripcion ||
-              draft.itemPendiente.cantidad <= 0 ||
-              draft.itemPendiente.precioUnitario <= 0
-            ) {
+            if (!target.descripcion || target.cantidad <= 0 || target.precioUnitario <= 0) {
               setStatus("Completa descripción, cantidad y precio (>0).");
               return;
             }
-            draft.items.push({ ...draft.itemPendiente });
-            draft.itemPendiente = { descripcion: "", cantidad: 1, precioUnitario: 0, alicuotaIva: 21 };
+            if (draft.modoCargaMoneda === "USD") {
+              if (!draft.cotizacionMep) {
+                setStatus("Primero refrescá la cotización MEP para convertir USD.");
+                return;
+              }
+              if (isCotizacionStale(draft.cotizacionMep.fechaActualizacion, maxAge)) {
+                setStatus("La cotización MEP está desactualizada. Refrescá antes de agregar el ítem.");
+                return;
+              }
+            }
+            draft.items.push({ ...target });
+            draft.itemPendiente = emptyItem();
+            draft.precioUnitarioUsd = 0;
             setStatus("Ítem agregado.");
           },
         },
@@ -589,42 +693,48 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     const p = posicionFiscal;
     const fmt = (n?: number) => (n != null ? n.toLocaleString("es-AR", { minimumFractionDigits: 2 }) : "-");
     const chunks: TextChunk[] = [];
-    chunks.push(fg("#2dd4bf")("Últimos 365 días\n\n"));
-    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
-    chunks.push(fg("#2dd4bf")("Ventas y ND: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.ventasYND)}\n`));
-    chunks.push(fg("#2dd4bf")("Notas de Crédito: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.notasCredito)}\n`));
-    chunks.push(fg("#2dd4bf")("Total ventas: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.totalVentas)}\n`));
-    chunks.push(fg("#2dd4bf")("Compras: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.compras)}\n`));
-    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
-    chunks.push(fg("#2dd4bf")("Tope Cat. D (S): "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.topeCatD)}\n`));
-    chunks.push(fg("#2dd4bf")("Consumido %: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.consumidoCatD)}%\n`));
-    chunks.push(fg("#2dd4bf")("Remanente facturable: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.remanenteFacturable)}\n`));
-    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
-    chunks.push(fg("#2dd4bf")("Tope Máximo Serv (K): "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.topeMaxServK)}\n`));
-    chunks.push(fg("#2dd4bf")("Consumido %: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.consumidoMaxServK)}%\n`));
-    chunks.push(fg("#2dd4bf")("Remanente para RINS: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.remanenteRINS)}\n`));
-    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
-    chunks.push(fg("#2dd4bf")("% Compras + Gastos s/Tope (40% Cat.K): "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.pctComprasGastos)}%\n`));
-    chunks.push(fg("#2dd4bf")("Remanente compras + gastos: "));
-    chunks.push(fg("#e6edf3")(`${fmt(p.remanenteComprasGastos)}\n`));
+    const fuente = typeof p.raw?.["_fuente"] === "string" ? p.raw["_fuente"] : undefined;
+    const categoria = typeof p.raw?.["_categoria_monotributo"] === "string" ? p.raw["_categoria_monotributo"] : "-";
+    const origenCategoria =
+      typeof p.raw?.["_categoria_monotributo_origen"] === "string" ? String(p.raw["_categoria_monotributo_origen"]) : undefined;
 
-    if (p.raw && Object.keys(p.raw).length > 0 && !p.ventasYND && !p.topeCatD) {
-      chunks.push(fg("#8b949e")("\n(Datos crudos de la API - estructura puede variar)\n"));
-      for (const [k, v] of Object.entries(p.raw).slice(0, 15)) {
-        if (v != null && typeof v !== "object") chunks.push(fg("#8b949e")(`  ${k}: ${String(v)}\n`));
-      }
+    chunks.push(fg("#22d3ee")("Últimos 365 días\n"));
+    if (fuente === "consultas_venta_compra" || fuente === "api_parametros_mas_consultas") {
+      chunks.push(fg("#94a3b8")("(Resumen combinado: API + consultas de ventas/compras/gastos)\n"));
+      chunks.push(fg("#94a3b8")("(Solo se contabilizan ventas con CAE)\n\n"));
+    } else {
+      chunks.push(fg("#94a3b8")("\n"));
     }
+    const sep = "────────────────────────────────────────────────────────────────";
+    const row = (label: string, value: string, labelColor = "#22d3ee", valueColor = "#f8fafc") => {
+      chunks.push(fg(labelColor)(`${label}: `));
+      chunks.push(fg(valueColor)(`${value}\n`));
+    };
+
+    chunks.push(fg("#475569")(`${sep}\n`));
+    row("Ventas y ND", fmt(p.ventasYND));
+    row("Notas de Crédito", fmt(p.notasCredito));
+    row("Total ventas", fmt(p.totalVentas), "#67e8f9", "#ffffff");
+    row("Compras", fmt(p.compras));
+
+    chunks.push(fg("#475569")(`${sep}\n`));
+    row(
+      "Categoría monotributo",
+      origenCategoria === "estimada" ? `${String(categoria)} (estimada)` : String(categoria),
+      "#f59e0b",
+      "#ffffff",
+    );
+    row("Tope de categoría", fmt(p.topeCatD), "#f59e0b", "#ffffff");
+    row("Consumido del tope", `${fmt(p.consumidoCatD)}%`, "#f59e0b", "#ffffff");
+    row("Remanente hasta el tope", fmt(p.remanenteFacturable), "#f59e0b", "#ffffff");
+
+    chunks.push(fg("#475569")(`${sep}\n`));
+    row("Tope máximo monotributo", fmt(p.topeMaxServK), "#a78bfa", "#ffffff");
+    row("Remanente al tope máximo", fmt(p.remanenteRINS), "#a78bfa", "#ffffff");
+
+    chunks.push(fg("#475569")(`${sep}\n`));
+    row("% Compras + Gastos s/Tope (40% Cat.K)", `${fmt(p.pctComprasGastos)}%`, "#38bdf8", "#ffffff");
+    row("Remanente compras + gastos", fmt(p.remanenteComprasGastos), "#38bdf8", "#ffffff");
 
     body.content = new StyledText(chunks);
   }
@@ -691,19 +801,55 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     title.content = `╭─ NUEVA FACTURA (${step.toUpperCase()}) ───────────────────────────────────────────╮`;
     helper.content = clientPickerActive
       ? "↑/↓ elegir cliente • Enter seleccionar • Esc cancelar"
-      : productPickerActive
-        ? "↑/↓ elegir producto • Enter agregar • Esc cancelar"
-        : "↑/↓ mover • Enter editar/accionar • Esc atrás • Tab sugerencias cliente";
+        : productPickerActive
+          ? "↑/↓ elegir producto • Enter agregar • Esc cancelar"
+        : step === "items"
+          ? "↑/↓ mover • ítems editables inline • USD/ARS aplica a todos los precios"
+          : "↑/↓ mover • Escribir para editar • Opt+←/→ palabra • Cmd+←/→ inicio/fin • Shift selecciona";
 
     const chunks: TextChunk[] = [];
+
+    const renderInputBox = (value: string, selected: boolean) => {
+      if (!selected) {
+        const shown = value.length ? value : " ";
+        chunks.push(fg("#a0a8b3")(`${shown}`));
+        return;
+      }
+
+      clampInputCursor(value);
+      const selection = getSelectionRange(value);
+      const safeValue = value.length ? value : " ";
+      const left = selection ? selection.start : inputCursor;
+      const right = selection ? selection.end : inputCursor;
+      const before = safeValue.slice(0, left);
+      const mid = safeValue.slice(left, right);
+      const after = safeValue.slice(right);
+
+      if (before) chunks.push(bg("#d8dee4")(fg("#000000")(before)));
+      if (selection) {
+        const selectedText = mid.length ? mid : " ";
+        chunks.push(bg("#7fb2ff")(fg("#000000")(selectedText)));
+      } else {
+        chunks.push(bg("#7fb2ff")(fg("#000000")(" ")));
+      }
+      if (after) chunks.push(bg("#d8dee4")(fg("#000000")(after)));
+    };
+
     fields.forEach((f, i) => {
+      if (
+        step === "items" &&
+        (f.key === "item0-descripcion" || f.key === "seleccionarProducto" || f.key === "next")
+      ) {
+        chunks.push(fg("#8b949e")("\n"));
+      }
       const isSelected = cursor === i;
-      const prefix = isSelected ? (editing && f.setValue ? "✎" : "❯") : " ";
+      const prefix = isSelected ? (f.setValue ? "✎" : "❯") : " ";
       chunks.push(isSelected ? fg("#2dd4bf")(prefix + " ") : fg("#8b949e")(prefix + " "));
       if (f.action && !f.setValue) {
         chunks.push(isSelected ? fg("#e6edf3")(`[ ${f.label} ]`) : fg("#8b949e")(`[ ${f.label} ]`));
       } else {
-        chunks.push(isSelected ? fg("#e6edf3")(`${f.label}: ${f.value()}`) : fg("#8b949e")(`${f.label}: ${f.value()}`));
+        chunks.push(isSelected ? fg("#e6edf3")(`${f.label}: `) : fg("#8b949e")(`${f.label}: `));
+        renderInputBox(f.value(), isSelected && Boolean(f.setValue));
       }
       chunks.push(fg("#8b949e")("\n"));
     });
@@ -744,15 +890,32 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       ),
     );
 
-    if (step === "items" && draft.items.length) {
-      chunks.push(fg("#8b949e")("\n\nItems actuales:\n"));
-      draft.items.forEach((it, index) => {
+    if (step === "items") {
+      chunks.push(fg("#8b949e")("\n"));
+      if (draft.cotizacionMep) {
+        const maxAgeMinutes = Number.parseInt(process.env.DOLAR_MEP_MAX_AGE_MINUTES ?? "180", 10);
+        const stale = isCotizacionStale(
+          draft.cotizacionMep.fechaActualizacion,
+          Number.isFinite(maxAgeMinutes) ? maxAgeMinutes : 180,
+        );
         chunks.push(
-          fg("#e6edf3")(
-            `  ${index + 1}. ${it.descripcion} | ${formatMonto(it.cantidad)} x ${formatMonto(it.precioUnitario)}\n`,
+          fg(stale ? "#f59e0b" : "#2dd4bf")(
+            `MEP compra: ${formatMonto(draft.cotizacionMep.compra)} (${stale ? "desactualizada" : "vigente"})`,
           ),
         );
-      });
+        chunks.push(fg("#8b949e")(` • act: ${draft.cotizacionMep.fechaActualizacion}`));
+      } else {
+        chunks.push(fg("#8b949e")("MEP: sin cotización cargada."));
+      }
+
+      if (draft.modoCargaMoneda === "USD" && draft.itemPendiente.precioUnitario > 0 && draft.cotizacionMep) {
+        const precioUsd = draft.itemPendiente.precioUnitario / draft.cotizacionMep.compra;
+        chunks.push(
+          fg("#8b949e")(
+            `\nHelper USD: ${formatMonto(precioUsd)} x ${formatMonto(draft.cotizacionMep.compra)} = ${formatMonto(draft.itemPendiente.precioUnitario)} ARS`,
+          ),
+        );
+      }
     }
 
     body.content = new StyledText(chunks);
@@ -760,11 +923,25 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
   function renderEmailInput() {
     title.content = "╭─ ENVIAR FACTURA POR MAIL ───────────────────────────────────────────────────╮";
-    helper.content = "Ingresá emails separados por coma • Enter enviar • Esc cancelar";
+    helper.content = "Enter enviar • Esc cancelar • Opt+←/→ palabra • Cmd+←/→ inicio/fin • Shift selecciona";
     const chunks: TextChunk[] = [];
     chunks.push(fg("#2dd4bf")("Emails (separados por coma):\n\n"));
-    chunks.push(fg("#e6edf3")(emailInputValue || "(vacío)"));
-    chunks.push(fg("#8b949e")("▌"));
+    clampInputCursor(emailInputValue);
+    const selection = getSelectionRange(emailInputValue);
+    const safeValue = emailInputValue.length ? emailInputValue : " ";
+    const left = selection ? selection.start : inputCursor;
+    const right = selection ? selection.end : inputCursor;
+    const before = safeValue.slice(0, left);
+    const mid = safeValue.slice(left, right);
+    const after = safeValue.slice(right);
+    if (before) chunks.push(bg("#d8dee4")(fg("#000000")(before)));
+    if (selection) {
+      const selectedText = mid.length ? mid : " ";
+      chunks.push(bg("#7fb2ff")(fg("#000000")(selectedText)));
+    } else {
+      chunks.push(bg("#7fb2ff")(fg("#000000")(" ")));
+    }
+    if (after) chunks.push(bg("#d8dee4")(fg("#000000")(after)));
     if (emailEnviando) chunks.push(fg("#8b949e")("\n\nEnviando..."));
     body.content = new StyledText(chunks);
   }
@@ -792,9 +969,42 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
   function onCharInput(field: Field, key: KeyEvent) {
     if (!field.setValue) return;
     const current = field.value();
-    if (key.name === "backspace") field.setValue(current.slice(0, -1));
-    else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta)
-      field.setValue(current + key.sequence);
+    clampInputCursor(current);
+    const selection = getSelectionRange(current);
+
+    if (key.name === "backspace") {
+      if (selection) {
+        field.setValue(current.slice(0, selection.start) + current.slice(selection.end));
+        inputCursor = selection.start;
+      } else if (inputCursor > 0) {
+        field.setValue(current.slice(0, inputCursor - 1) + current.slice(inputCursor));
+        inputCursor -= 1;
+      }
+      selectionAnchor = null;
+      return;
+    }
+
+    if (key.name === "delete") {
+      if (selection) {
+        field.setValue(current.slice(0, selection.start) + current.slice(selection.end));
+        inputCursor = selection.start;
+      } else if (inputCursor < current.length) {
+        field.setValue(current.slice(0, inputCursor) + current.slice(inputCursor + 1));
+      }
+      selectionAnchor = null;
+      return;
+    }
+
+    if (key.sequence && /^[^\r\n\t]$/.test(key.sequence) && !key.ctrl && !key.meta) {
+      if (selection) {
+        field.setValue(current.slice(0, selection.start) + key.sequence + current.slice(selection.end));
+        inputCursor = selection.start + key.sequence.length;
+      } else {
+        field.setValue(current.slice(0, inputCursor) + key.sequence + current.slice(inputCursor));
+        inputCursor += key.sequence.length;
+      }
+      selectionAnchor = null;
+    }
   }
 
   async function onKeyDown(key: KeyEvent) {
@@ -808,6 +1018,8 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         if (f.cliente.id) {
           emailInputActive = true;
           emailInputValue = f.cliente.email ?? process.env.SOS_CONTADOR_EMAIL ?? "";
+          inputCursor = emailInputValue.length;
+          selectionAnchor = null;
           emailInputContext = { factura: f, source: "inicio" };
         } else {
           setStatus("El cliente no tiene ID para enviar.");
@@ -824,6 +1036,7 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           step = "cliente";
           draft = createEmptyDraft(getMayorPuntoVentaDisponible());
           cursor = 0;
+          setInputFocusToField(getFields()[cursor]);
         } else if (selected === "Listar facturas") {
           view = "facturas";
           invoiceCursor = 0;
@@ -860,9 +1073,56 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     }
 
     if (emailInputActive) {
+      const value = emailInputValue;
+      const withShiftSelection = key.shift;
+
+      if ((key.ctrl || key.meta) && key.name === "a") {
+        selectionAnchor = 0;
+        inputCursor = value.length;
+        render();
+        return;
+      }
+
+      if (key.name === "home") {
+        moveCursor(value, 0, withShiftSelection);
+        render();
+        return;
+      }
+
+      if (key.name === "end") {
+        moveCursor(value, value.length, withShiftSelection);
+        render();
+        return;
+      }
+
+      if (key.name === "left") {
+        if (key.meta && !key.option) {
+          moveCursor(value, 0, withShiftSelection);
+        } else if (key.option) {
+          moveCursor(value, moveWordLeft(value, inputCursor), withShiftSelection);
+        } else {
+          moveCursor(value, inputCursor - 1, withShiftSelection);
+        }
+        render();
+        return;
+      }
+
+      if (key.name === "right") {
+        if (key.meta && !key.option) {
+          moveCursor(value, value.length, withShiftSelection);
+        } else if (key.option) {
+          moveCursor(value, moveWordRight(value, inputCursor), withShiftSelection);
+        } else {
+          moveCursor(value, inputCursor + 1, withShiftSelection);
+        }
+        render();
+        return;
+      }
+
       if (key.name === "escape") {
         emailInputActive = false;
         emailInputContext = null;
+        selectionAnchor = null;
       } else if (key.name === "enter" || key.name === "return") {
         const ctx = emailInputContext;
         if (!ctx) return;
@@ -886,16 +1146,39 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
             if (ctx.source === "inicio") facturaRecienEmitida = null;
             emailInputActive = false;
             emailInputContext = null;
+            selectionAnchor = null;
           } catch (err) {
             setStatus(err instanceof SosContadorClientError ? err.message : "Error al enviar email.");
           } finally {
             emailEnviando = false;
           }
         }
-      } else if (key.name === "backspace") {
-        emailInputValue = emailInputValue.slice(0, -1);
-      } else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
-        emailInputValue += key.sequence;
+      } else if (key.name === "backspace" || key.name === "delete") {
+        clampInputCursor(emailInputValue);
+        const selection = getSelectionRange(emailInputValue);
+        if (selection) {
+          emailInputValue = emailInputValue.slice(0, selection.start) + emailInputValue.slice(selection.end);
+          inputCursor = selection.start;
+        } else if (key.name === "backspace" && inputCursor > 0) {
+          emailInputValue = emailInputValue.slice(0, inputCursor - 1) + emailInputValue.slice(inputCursor);
+          inputCursor -= 1;
+        } else if (key.name === "delete" && inputCursor < emailInputValue.length) {
+          emailInputValue = emailInputValue.slice(0, inputCursor) + emailInputValue.slice(inputCursor + 1);
+        }
+        selectionAnchor = null;
+      } else if (key.sequence && /^[^\r\n\t]$/.test(key.sequence) && !key.ctrl && !key.meta) {
+        clampInputCursor(emailInputValue);
+        const selection = getSelectionRange(emailInputValue);
+        if (selection) {
+          emailInputValue =
+            emailInputValue.slice(0, selection.start) + key.sequence + emailInputValue.slice(selection.end);
+          inputCursor = selection.start + key.sequence.length;
+        } else {
+          emailInputValue =
+            emailInputValue.slice(0, inputCursor) + key.sequence + emailInputValue.slice(inputCursor);
+          inputCursor += key.sequence.length;
+        }
+        selectionAnchor = null;
       }
       render();
       return;
@@ -912,7 +1195,7 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           view = "nueva";
           step = "items";
           cursor = 0;
-          itemEditIndex = null;
+          setInputFocusToField(getFields()[cursor]);
           setStatus("Factura cargada para repetir. Editá ítems con Enter, luego emití.");
         }
       } else if (key.name === "e") {
@@ -920,6 +1203,8 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         if (f && f.cliente.id) {
           emailInputActive = true;
           emailInputValue = f.cliente.email ?? process.env.SOS_CONTADOR_EMAIL ?? "";
+          inputCursor = emailInputValue.length;
+          selectionAnchor = null;
           emailInputContext = { factura: f, source: "detalle" };
         } else {
           setStatus("El cliente debe tener ID para enviar.");
@@ -970,7 +1255,8 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           precioUnitario: p.precioUnitario,
           alicuotaIva: p.alicuotaIva,
         });
-        draft.itemPendiente = { descripcion: "", cantidad: 1, precioUnitario: 0, alicuotaIva: 21 };
+        draft.itemPendiente = emptyItem();
+        draft.precioUnitarioUsd = 0;
         productPickerActive = false;
         setStatus(`Producto agregado: ${p.descripcion}`);
       }
@@ -982,15 +1268,58 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     const field = fields[cursor];
     if (!field) return;
 
-    if (editing && field.setValue) {
-      if (key.name === "enter" || key.name === "return" || key.name === "escape") editing = false;
-      else onCharInput(field, key);
-      render();
-      return;
+    if (field.setValue) {
+      const value = field.value();
+      const withShiftSelection = key.shift;
+
+      if ((key.ctrl || key.meta) && key.name === "a") {
+        selectionAnchor = 0;
+        inputCursor = value.length;
+        render();
+        return;
+      }
+
+      if (key.name === "home") {
+        moveCursor(value, 0, withShiftSelection);
+        render();
+        return;
+      }
+
+      if (key.name === "end") {
+        moveCursor(value, value.length, withShiftSelection);
+        render();
+        return;
+      }
+
+      if (key.name === "left") {
+        if (key.meta && !key.option) {
+          moveCursor(value, 0, withShiftSelection);
+        } else if (key.option) {
+          moveCursor(value, moveWordLeft(value, inputCursor), withShiftSelection);
+        } else {
+          moveCursor(value, inputCursor - 1, withShiftSelection);
+        }
+        render();
+        return;
+      }
+
+      if (key.name === "right") {
+        if (key.meta && !key.option) {
+          moveCursor(value, value.length, withShiftSelection);
+        } else if (key.option) {
+          moveCursor(value, moveWordRight(value, inputCursor), withShiftSelection);
+        } else {
+          moveCursor(value, inputCursor + 1, withShiftSelection);
+        }
+        render();
+        return;
+      }
     }
 
+    const prevCursor = cursor;
     if (key.name === "down") cursor = (cursor + 1) % fields.length;
     if (key.name === "up") cursor = (cursor - 1 + fields.length) % fields.length;
+    if (cursor !== prevCursor) setInputFocusToField(fields[cursor]);
 
     if (key.name === "escape") {
       if (clientPickerActive) {
@@ -1018,8 +1347,18 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       }
     }
 
+    if (
+      field.setValue &&
+      (key.name === "backspace" ||
+        key.name === "delete" ||
+        (key.sequence && /^[^\r\n\t]$/.test(key.sequence) && !key.ctrl && !key.meta))
+    ) {
+      onCharInput(field, key);
+      render();
+      return;
+    }
+
     if (key.name === "enter" || key.name === "return") {
-      if (field.setValue && !field.action) editing = true;
       if (field.action) await field.action();
     }
 

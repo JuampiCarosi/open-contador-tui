@@ -1,5 +1,14 @@
 import type { Cliente, Factura, ItemFactura } from "../../types";
 
+export type MonedaCarga = "ARS" | "USD";
+
+export interface CotizacionMep {
+  compra: number;
+  venta: number;
+  fechaActualizacion: string;
+  fetchedAt: number;
+}
+
 export interface FacturaDraft {
   idOrigen?: string;
   puntoVenta: number;
@@ -9,6 +18,25 @@ export interface FacturaDraft {
   observaciones: string;
   items: ItemFactura[];
   itemPendiente: ItemFactura;
+  modoCargaMoneda: MonedaCarga;
+  precioUnitarioUsd: number;
+  cotizacionMep?: CotizacionMep;
+}
+
+export function roundMoney(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(value * 100) / 100;
+}
+
+export function convertUsdToArs(precioUnitarioUsd: number, cotizacionCompra: number): number {
+  return roundMoney(precioUnitarioUsd * cotizacionCompra);
+}
+
+export function isCotizacionStale(fechaActualizacion: string, maxAgeMinutes: number): boolean {
+  const parsed = Date.parse(fechaActualizacion);
+  if (!Number.isFinite(parsed)) return true;
+  const ageMs = Date.now() - parsed;
+  return ageMs > maxAgeMinutes * 60 * 1000;
 }
 
 export function emptyItem(): ItemFactura {
@@ -36,6 +64,8 @@ export function createEmptyDraft(puntoVenta = 1): FacturaDraft {
     observaciones: "",
     items: [],
     itemPendiente: emptyItem(),
+    modoCargaMoneda: "ARS",
+    precioUnitarioUsd: 0,
   };
 }
 
@@ -49,6 +79,8 @@ export function draftFromFactura(factura: Factura): FacturaDraft {
     observaciones: factura.observaciones ?? "",
     items: factura.items.map((item) => ({ ...item })),
     itemPendiente: emptyItem(),
+    modoCargaMoneda: "ARS",
+    precioUnitarioUsd: 0,
   };
 }
 

@@ -13,6 +13,12 @@ interface ApiErrorBody {
   errors?: Record<string, string[] | string>;
 }
 
+interface MonotributoCategoria {
+  categoria: string;
+  ingresosBrutos: number;
+  version: number | undefined;
+}
+
 export class SosContadorClientError extends Error {}
 
 function unwrapArray<T>(response: unknown): T[] {
@@ -50,27 +56,139 @@ function mapParametrosToPosicionFiscal(p: Record<string, unknown>): PosicionFisc
   return result;
 }
 
+function hasPosicionFiscalData(p: PosicionFiscal): boolean {
+  return [
+    p.ventasYND,
+    p.notasCredito,
+    p.totalVentas,
+    p.compras,
+    p.topeCatD,
+    p.consumidoCatD,
+    p.remanenteFacturable,
+    p.topeMaxServK,
+    p.consumidoMaxServK,
+    p.remanenteRINS,
+    p.pctComprasGastos,
+    p.remanenteComprasGastos,
+  ].some((v) => typeof v === "number" && !Number.isNaN(v));
+}
+
+function parseAmount(v: unknown): number {
+  if (typeof v === "number" && !Number.isNaN(v)) return v;
+  if (typeof v === "string") {
+    const normalized = v.replace(/\./g, "").replace(",", ".");
+    const parsed = Number.parseFloat(normalized);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+}
+
+function hasCae(record: Record<string, unknown>): boolean {
+  const cae = record.cae ?? record.caeNumero ?? record.caenumero;
+  if (cae == null) return false;
+  const value = String(cae).trim().toLowerCase();
+  return value.length > 0 && value !== "0" && value !== "null" && value !== "undefined";
+}
+
+function extractCategoriaMonotributo(source: Record<string, unknown>): string | undefined {
+  const categories = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"] as const;
+  const byNumber = (n: number) => (n >= 1 && n <= categories.length ? categories[n - 1] : undefined);
+
+  const visit = (value: unknown, path: string): string | undefined => {
+    if (value == null) return undefined;
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) {
+        const found = visit(value[i], `${path}[${i}]`);
+        if (found) return found;
+      }
+      return undefined;
+    }
+    if (typeof value === "object") {
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        const found = visit(v, path ? `${path}.${k}` : k);
+        if (found) return found;
+      }
+      return undefined;
+    }
+
+    const key = path.toLowerCase();
+    const isCategoriaKey = key.includes("categoria") || key.includes("catmono") || key.includes("monotrib");
+    if (!isCategoriaKey) return undefined;
+
+    if (typeof value === "string") {
+      const normalized = value.trim().toUpperCase();
+      if (/^[A-K]$/.test(normalized)) return normalized;
+      const fromText = normalized.match(/\b([A-K])\b/);
+      if (fromText?.[1]) return fromText[1];
+      const n = Number.parseInt(normalized, 10);
+      if (!Number.isNaN(n)) return byNumber(n);
+      return undefined;
+    }
+
+    if (typeof value === "number" && Number.isInteger(value)) {
+      return byNumber(value);
+    }
+
+    return undefined;
+  };
+
+  return visit(source, "");
+}
+
+function normalizeCategoriaLetter(v: unknown): string | undefined {
+  if (typeof v === "string") {
+    const normalized = v.trim().toUpperCase();
+    if (/^[A-L]$/.test(normalized)) return normalized;
+    const fromText = normalized.match(/\b([A-L])\b/);
+    if (fromText?.[1]) return fromText[1];
+  }
+  if (typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 12) {
+    return String.fromCharCode("A".charCodeAt(0) + v - 1);
+  }
+  return undefined;
+}
+
 function mapVentaToFactura(v: Record<string, unknown>): Factura {
   const cab = (v.cabecera ?? v) as Record<string, unknown>;
   const id = String(cab.id ?? v.id ?? cab.idcomprobante ?? "");
   const pv = cab.puntoventa != null ? String(cab.puntoventa) : "";
   const num = cab.numero != null ? String(cab.numero) : "";
-  const numero = pv && num ? `${pv.padStart(3, "0")}-${num.padStart(8, "0")}` : String(v.numero ?? num ? num : id);
+  const numero = pv && num ? `${pv.padStart(3, "0")}-${num.padStart(8, "0")}` : String((v.numero ?? num) ? num : id);
   const puntoVentaFromNumero = numero.match(/^(\d{1,5})-/)?.[1];
-  const puntoVenta = pv ? Number.parseInt(pv, 10) : puntoVentaFromNumero ? Number.parseInt(puntoVentaFromNumero, 10) : undefined;
+  const puntoVenta = pv
+    ? Number.parseInt(pv, 10)
+    : puntoVentaFromNumero
+      ? Number.parseInt(puntoVentaFromNumero, 10)
+      : undefined;
   const fechaRaw = cab.fecha ?? v.fecha ?? cab.fecha_emision ?? "";
   const fechaEmision = typeof fechaRaw === "string" ? fechaRaw.slice(0, 10) : String(fechaRaw);
 
-  const caeNumero = cab.caenumero != null ? String(cab.caenumero) : undefined;
+  const caeNumero = cab.caenumero != null ? String(cab.caenumero) : cab.cae != null ? String(cab.cae) : undefined;
   const caeVencimiento = cab.caevencimiento != null ? String(cab.caevencimiento) : undefined;
 
   const clienteRaw = (cab.cliente ?? cab) as Record<string, unknown>;
   const cliente = {
-    id: clienteRaw.idclipro != null ? String(clienteRaw.idclipro) : clienteRaw.id != null ? String(clienteRaw.id) : undefined,
+    id:
+      clienteRaw.idclipro != null
+        ? String(clienteRaw.idclipro)
+        : clienteRaw.id != null
+          ? String(clienteRaw.id)
+          : undefined,
     cuit: String(clienteRaw.cuit ?? cab.cuit ?? clienteRaw.identificacion ?? ""),
-    razonSocial: String(clienteRaw.razon_social ?? clienteRaw.razonsocial ?? cab.clipro ?? clienteRaw.clipro ?? cab.clipro ?? clienteRaw.nombre ?? ""),
+    razonSocial: String(
+      clienteRaw.razon_social ??
+        clienteRaw.razonsocial ??
+        cab.clipro ??
+        clienteRaw.clipro ??
+        cab.clipro ??
+        clienteRaw.nombre ??
+        "",
+    ),
     email: (clienteRaw.email ?? cab.email) != null ? String(clienteRaw.email ?? cab.email) : undefined,
-    direccion: (clienteRaw.direccion ?? cab.domicilio ?? clienteRaw.domicilio) != null ? String(clienteRaw.direccion ?? cab.domicilio ?? clienteRaw.domicilio) : undefined,
+    direccion:
+      (clienteRaw.direccion ?? cab.domicilio ?? clienteRaw.domicilio) != null
+        ? String(clienteRaw.direccion ?? cab.domicilio ?? clienteRaw.domicilio)
+        : undefined,
     telefono: (clienteRaw.telefono ?? cab.telefono) != null ? String(clienteRaw.telefono ?? cab.telefono) : undefined,
   };
 
@@ -81,7 +199,9 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
     const monto = Number(it.monto ?? it.v ?? it.importe ?? it.montohaber ?? it.subtotal ?? cant * precio);
     const precioUnit = precio > 0 ? precio : cant > 0 ? monto / cant : monto;
     return {
-      descripcion: String(it.producto ?? it.producto_impresion ?? it.descripcion ?? it.d ?? it.concepto ?? it.desc ?? it.memo ?? ""),
+      descripcion: String(
+        it.producto ?? it.producto_impresion ?? it.descripcion ?? it.d ?? it.concepto ?? it.desc ?? it.memo ?? "",
+      ),
       cantidad: cant,
       precioUnitario: precioUnit,
       alicuotaIva: Number(it.alicuota ?? it.alicuota_iva ?? it.fa ?? it.a ?? 21),
@@ -114,14 +234,24 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
   }
   if (total === 0) {
     for (const [k, val] of Object.entries(v)) {
-      if (typeof val === "number" && val > 0 && (k.toLowerCase().includes("total") || k.toLowerCase().includes("importe") || k.toLowerCase().includes("monto"))) {
+      if (
+        typeof val === "number" &&
+        val > 0 &&
+        (k.toLowerCase().includes("total") || k.toLowerCase().includes("importe") || k.toLowerCase().includes("monto"))
+      ) {
         total = val;
         break;
       }
     }
     if (total === 0 && typeof cab === "object" && cab !== v) {
       for (const [k, val] of Object.entries(cab)) {
-        if (typeof val === "number" && val > 0 && (k.toLowerCase().includes("total") || k.toLowerCase().includes("importe") || k.toLowerCase().includes("monto"))) {
+        if (
+          typeof val === "number" &&
+          val > 0 &&
+          (k.toLowerCase().includes("total") ||
+            k.toLowerCase().includes("importe") ||
+            k.toLowerCase().includes("monto"))
+        ) {
           total = val;
           break;
         }
@@ -153,6 +283,7 @@ export class SosContadorClient {
   private readonly puntoVenta: number;
   private readonly auth?: AuthPayload;
   private readonly cuitId?: string;
+  private monotributoCategorias?: MonotributoCategoria[];
 
   constructor() {
     this.baseUrl = (process.env.SOS_CONTADOR_BASE_URL ?? "").trim();
@@ -193,10 +324,10 @@ export class SosContadorClient {
 
     let idcuit = this.cuitId;
     if (!idcuit) {
-      const cuits = await this.request<Array<{ id: number; cuit: string; razonsocial: string }>>(
-        "/cuit/listado",
-        { method: "GET", authMode: "jwt" },
-      );
+      const cuits = await this.request<Array<{ id: number; cuit: string; razonsocial: string }>>("/cuit/listado", {
+        method: "GET",
+        authMode: "jwt",
+      });
       const list = Array.isArray(cuits) ? cuits : unwrapArray<{ id: number }>(cuits);
       if (!list.length) {
         throw new SosContadorClientError("No se encontró ninguna CUIT asociada al usuario.");
@@ -204,21 +335,12 @@ export class SosContadorClient {
       idcuit = String(list[0]!.id);
     }
 
-    const resp = await this.request<{ jwt: string }>(
-      `/cuit/credentials/${idcuit}`,
-      { method: "GET", authMode: "jwt" },
-    );
+    const resp = await this.request<{ jwt: string }>(`/cuit/credentials/${idcuit}`, { method: "GET", authMode: "jwt" });
     this.jwtc = resp.jwt;
     return this.jwtc;
   }
 
-  async listarFacturas(
-    modo = "T",
-    periodo = "anio",
-    cae = "T",
-    pagina = 1,
-    registros = 100,
-  ): Promise<Factura[]> {
+  async listarFacturas(modo = "T", periodo = "anio", cae = "T", pagina = 1, registros = 100): Promise<Factura[]> {
     if (!this.baseUrl) return [];
     const hoy = new Date();
     const hace2Anios = new Date(hoy);
@@ -261,10 +383,7 @@ export class SosContadorClient {
       pagina: String(pagina),
       registros: String(registros),
     });
-    const resp = await this.request<unknown>(
-      `/cliente/listado?${params}`,
-      { method: "GET" },
-    );
+    const resp = await this.request<unknown>(`/cliente/listado?${params}`, { method: "GET" });
     const raw = unwrapArray<Record<string, string>>(resp);
     return raw.map((it) => ({
       id: it.id,
@@ -293,7 +412,11 @@ export class SosContadorClient {
     }));
   }
 
-  async enviarFacturaPorEmail(comprobanteId: string, idcliente: string, email: string): Promise<{ ok: boolean; response?: unknown }> {
+  async enviarFacturaPorEmail(
+    comprobanteId: string,
+    idcliente: string,
+    email: string,
+  ): Promise<{ ok: boolean; response?: unknown }> {
     if (!this.baseUrl) throw new SosContadorClientError("SOS_CONTADOR_BASE_URL no está configurado.");
     const body = { comprobantes: [comprobanteId], idcliente, email };
     const log = (msg: string) => {
@@ -320,6 +443,93 @@ export class SosContadorClient {
     }
   }
 
+  private async getCategoriaMonotributoDesdeSos(cuitParams: Record<string, unknown>): Promise<string | undefined> {
+    const direct = extractCategoriaMonotributo(cuitParams);
+    if (direct) return direct;
+
+    try {
+      const listado = await this.request<unknown>("/cuit/listado", { method: "GET", authMode: "jwt" });
+      const items = unwrapArray<Record<string, unknown>>(listado);
+      const idCuitActual = cuitParams.idcuit != null ? String(cuitParams.idcuit) : undefined;
+      const cuitActual = cuitParams.cuit != null ? String(cuitParams.cuit) : undefined;
+      const selected =
+        items.find((it) => idCuitActual && String(it.id ?? "") === idCuitActual) ??
+        items.find((it) => cuitActual && String(it.cuit ?? "") === cuitActual) ??
+        items[0];
+      if (!selected) return undefined;
+      return normalizeCategoriaLetter(selected.categoria ?? selected.monotributo ?? selected.catmono);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async fetchMonotributoCategoriasDesdeSos(): Promise<MonotributoCategoria[]> {
+    if (this.monotributoCategorias) return this.monotributoCategorias;
+    try {
+      const resp = await this.request<unknown>("/tipo/listado/monotributo/", { method: "GET" });
+      const raw = unwrapArray<Record<string, unknown>>(resp);
+      const parsed: MonotributoCategoria[] = [];
+      for (const r of raw) {
+        const categoria = normalizeCategoriaLetter(r.monotributo ?? r.categoria);
+        const ingresosBrutos = parseAmount(r.montoanual_max ?? r.monto_anual_max ?? r.ingresos_brutos_max);
+        const version =
+          typeof r.version === "number" ? r.version : Number.parseInt(String(r.version ?? "0"), 10) || undefined;
+        if (!categoria || ingresosBrutos <= 0) continue;
+        parsed.push({ categoria, ingresosBrutos, version });
+      }
+
+      const latestVersion = parsed.reduce(
+        (max, r) => (typeof r.version === "number" && r.version > max ? r.version : max),
+        0,
+      );
+      const scoped = latestVersion > 0 ? parsed.filter((r) => r.version === latestVersion) : parsed;
+
+      const dedup = new Map<string, MonotributoCategoria>();
+      for (const row of scoped) {
+        if (!row.categoria) continue;
+        dedup.set(row.categoria, row);
+      }
+
+      const fromSos = Array.from(dedup.values()).sort((a, b) => a.ingresosBrutos - b.ingresosBrutos);
+      const maxSos = fromSos.length > 0 ? fromSos[fromSos.length - 1]!.ingresosBrutos : 0;
+
+      if (maxSos >= 1_000_000) {
+        this.monotributoCategorias = fromSos;
+        return this.monotributoCategorias;
+      }
+
+      const fromAfip = await this.fetchMonotributoCategoriasDesdeAfip();
+      this.monotributoCategorias = fromAfip.length > 0 ? fromAfip : fromSos;
+      return this.monotributoCategorias;
+    } catch {
+      const fromAfip = await this.fetchMonotributoCategoriasDesdeAfip();
+      this.monotributoCategorias = fromAfip;
+      return this.monotributoCategorias;
+    }
+  }
+
+  private async fetchMonotributoCategoriasDesdeAfip(): Promise<MonotributoCategoria[]> {
+    try {
+      const resp = await fetch("https://www.afip.gob.ar/monotributo/categorias.asp", {
+        method: "GET",
+        headers: { "Content-Type": "text/html" },
+      });
+      if (!resp.ok) return [];
+      const html = await resp.text();
+      const categorias: MonotributoCategoria[] = [];
+      const rowRegex = /<tr>\s*<th[^>]*>\s*([A-L])\s*<\/th>\s*<td[^>]*>\s*\$([^<]+)<\/td>/gim;
+      let match: RegExpExecArray | null;
+      while ((match = rowRegex.exec(html)) !== null) {
+        const categoria = normalizeCategoriaLetter(match[1]?.trim());
+        const ingresos = parseAmount(match[2]?.trim());
+        if (categoria && ingresos > 0) categorias.push({ categoria, ingresosBrutos: ingresos, version: undefined });
+      }
+      return categorias.sort((a, b) => a.ingresosBrutos - b.ingresosBrutos);
+    } catch {
+      return [];
+    }
+  }
+
   async buscarClientePorCuit(cuit: string): Promise<Cliente | null> {
     if (!cuit.trim()) return null;
     const clientes = await this.listarClientes();
@@ -332,6 +542,11 @@ export class SosContadorClient {
     }
 
     const idPath = draft.idOrigen ? `/${draft.idOrigen}` : "";
+    const itemsPesificados = draft.items.map((item) => ({
+      cantidad: Number.isFinite(item.cantidad) ? item.cantidad : 0,
+      precioUnitario: Number.isFinite(item.precioUnitario) ? item.precioUnitario : 0,
+      alicuotaIva: Number.isFinite(item.alicuotaIva) ? item.alicuotaIva : 0,
+    }));
 
     const resp = await this.request<Record<string, unknown>>(`/venta${idPath}`, {
       method: "PUT",
@@ -344,12 +559,12 @@ export class SosContadorClient {
         puntoventa: draft.puntoVenta > 0 ? draft.puntoVenta : this.puntoVenta,
         obtienecae: false,
         memo: draft.observaciones,
-        imputaciones: draft.items.map((item) => ({
+        imputaciones: itemsPesificados.map((item) => ({
           i: "neto",
           a: item.alicuotaIva,
           v: item.cantidad * item.precioUnitario,
         })),
-        productos: draft.items.map((item) => ({
+        productos: itemsPesificados.map((item) => ({
           id: 0,
           u: 7,
           fc: item.cantidad,
@@ -364,10 +579,7 @@ export class SosContadorClient {
     return factura;
   }
 
-  private async request<T>(
-    path: string,
-    init: RequestInit & { authMode?: "none" | "jwt" | "jwtc" } = {},
-  ): Promise<T> {
+  private async request<T>(path: string, init: RequestInit & { authMode?: "none" | "jwt" | "jwtc" } = {}): Promise<T> {
     const authMode = init.authMode ?? "jwtc";
     if (authMode === "jwtc") await this.authenticate();
     else if (authMode === "jwt") await this.authenticateUser();
