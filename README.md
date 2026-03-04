@@ -1,66 +1,46 @@
 # open-contador-tui
 
-Base inicial de una TUI para SOS Contador construida con **Bun + OpenTUI**.
+TUI de facturación para **SOS Contador** inspirada en la UX de `terminal.shop`: navegación tipo catálogo, panel principal con acciones rápidas, detalle contextual y flujo guiado para crear/repetir facturas.
 
-## Requisitos
+## Stack
 
-- [Bun](https://bun.sh) >= 1.2
+- Runtime + package manager: **Bun**
+- Framework TUI: **OpenTUI** (`@opentui/core`)
+- Backend: **SOS Contador API**
 
-## Instalación
+## Funcionalidades
+
+- Crear factura desde terminal con wizard en 4 pasos.
+- Campos contables con nombres originales: **CUIT**, **Razón social**, etc.
+- Listar facturas emitidas.
+- Repetir factura existente y editar antes de volver a emitir.
+- Autollenado de cliente:
+  - manual por acción `Autocompletar por CUIT`
+  - sugerencias por historial con tecla `Tab`
+- Resumen dinámico: subtotal, IVA y total.
+
+## Uso
 
 ```bash
 bun install
-```
-
-## Ejecutar en desarrollo
-
-```bash
-bun run dev
-```
-
-## Ejecutar en modo normal
-
-```bash
+cp .env.example .env
 bun run start
 ```
 
-## Validación de tipos
+## Comandos
 
 ```bash
+bun run dev
+bun run start
 bun run typecheck
 ```
 
-## Configuración de entorno
+## Variables de entorno
 
-Copia el archivo de ejemplo y completa tus credenciales:
+- `SOS_CONTADOR_BASE_URL` URL base de API (obligatoria para emitir/listar real).
+- `SOS_CONTADOR_API_TOKEN` token Bearer.
+- `SOS_CONTADOR_EMAIL` y `SOS_CONTADOR_PASSWORD` (alternativa para login).
+- `SOS_CONTADOR_TIMEOUT_MS` timeout HTTP.
+- `SOS_CONTADOR_RETRIES` reintentos.
 
-```bash
-cp .env.example .env
-```
-
-Variables disponibles:
-
-- `SOS_CONTADOR_BASE_URL`: URL base de la API.
-- `SOS_CONTADOR_API_TOKEN`: token Bearer (si ya lo tienes).
-- `SOS_CONTADOR_EMAIL` y `SOS_CONTADOR_PASSWORD`: credenciales para `authenticate()` si no hay token.
-- `SOS_CONTADOR_TIMEOUT_MS`: timeout por request en milisegundos.
-- `SOS_CONTADOR_RETRIES`: reintentos para errores transitorios (timeouts, 429 y 5xx).
-
-## Estructura
-
-```txt
-src/
-  main.ts
-  services/
-    sos-contador-client.ts
-  types/
-    cliente.ts
-    factura.ts
-    impuesto.ts
-    item-factura.ts
-  ui/
-    components/
-      header.ts
-    screens/
-      home-screen.ts
-```
+Si no configurás `SOS_CONTADOR_BASE_URL`, la app abre igual pero no podrá sincronizar ni emitir contra API real.
