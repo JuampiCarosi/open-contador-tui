@@ -7,11 +7,20 @@ import {
   fg,
   type TextChunk,
 } from "@opentui/core";
-import type { Cliente, Factura } from "../../types";
+import type { Cliente, Factura, Producto, PosicionFiscal } from "../../types";
+
+/** Formato argentino: 1.234,56 (punto miles, coma decimales) */
+function formatMonto(n: number): string {
+  return n.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatMontoPad(n: number, width: number): string {
+  return formatMonto(n).padStart(width);
+}
 import { SosContadorClient, SosContadorClientError } from "../../services/sos-contador-client";
 import { calcularTotales, createEmptyDraft, draftFromFactura, type FacturaDraft } from "../state/invoice-draft";
 
-type View = "inicio" | "nueva" | "facturas";
+type View = "inicio" | "nueva" | "facturas" | "facturaDetalle" | "posicionFiscal";
 type Step = "cliente" | "items" | "detalle" | "confirmar";
 
 interface Field {
@@ -58,8 +67,19 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
   let clientPickerCursor = 0;
   let facturaDetalle: Factura | null = null;
   let loadingDetalle = false;
+  let productos: Producto[] = [];
+  let productPickerActive = false;
+  let productPickerCursor = 0;
+  let posicionFiscal: PosicionFiscal | null = null;
+  let loadingPosicion = false;
+  let emailEnviando = false;
+  let facturaRecienEmitida: Factura | null = null;
+  let itemEditIndex: number | null = null;
+  let emailInputActive = false;
+  let emailInputValue = "";
+  let emailInputContext: { factura: Factura; source: "detalle" | "inicio" } | null = null;
 
-  const inicioMenu = ["Nueva factura", "Listar facturas", "Sincronizar datos", "Salir"];
+  const inicioMenu = ["Nueva factura", "Listar facturas", "Resumen posición fiscal", "Sincronizar datos", "Salir"];
 
   function selectedFactura(): Factura | undefined {
     return facturas[invoiceCursor];
@@ -129,36 +149,102 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
             }
             step = "items";
             cursor = 0;
+            itemEditIndex = null;
           },
         },
       ];
     }
 
     if (step === "items") {
+      const editingItem = itemEditIndex != null ? draft.items[itemEditIndex] : null;
+      const target = editingItem ?? draft.itemPendiente;
+
+      if (itemEditIndex != null && editingItem) {
+        return [
+          [
+            { key: "descripcion", label: "Descripción", value: () => editingItem.descripcion, setValue: (v: string) => (editingItem.descripcion = v) },
+            { key: "cantidad", label: "Cantidad", value: () => String(editingItem.cantidad), setValue: (v: string) => (editingItem.cantidad = Number.parseFloat(v) || 0) },
+            { key: "precio", label: "Precio unitario", value: () => String(editingItem.precioUnitario), setValue: (v: string) => (editingItem.precioUnitario = Number.parseFloat(v) || 0) },
+            { key: "iva", label: "Alicuota IVA %", value: () => String(editingItem.alicuotaIva), setValue: (v: string) => (editingItem.alicuotaIva = Number.parseFloat(v) || 0) },
+            {
+              key: "guardar",
+              label: "Guardar cambios",
+              value: () => "",
+              action: () => {
+                itemEditIndex = null;
+                setStatus("Cambios guardados.");
+              },
+            },
+            {
+              key: "eliminar",
+              label: "Eliminar ítem",
+              value: () => "",
+              action: () => {
+                draft.items.splice(itemEditIndex!, 1);
+                itemEditIndex = null;
+                setStatus("Ítem eliminado.");
+              },
+            },
+          ],
+        ].flat();
+      }
+
+      const itemFields: Field[] = draft.items.map((it, i) => ({
+        key: `item${i}`,
+        label: `Ítem ${i + 1}: ${it.descripcion.slice(0, 25)} | ${it.cantidad} x ${it.precioUnitario}`,
+        value: () => "",
+        action: () => {
+          itemEditIndex = i;
+          cursor = 0;
+        },
+      }));
+
       return [
+        {
+          key: "seleccionarProducto",
+          label: "Seleccionar de inventario",
+          value: () => "",
+          action: async () => {
+            if (productos.length === 0) {
+              try {
+                productos = await client.listarProductos();
+              } catch {
+                setStatus("No se pudo cargar inventario.");
+                return;
+              }
+            }
+            if (productos.length === 0) {
+              setStatus("No hay productos en el inventario. Sincronizá o cargá productos en SOS.");
+              return;
+            }
+            productPickerActive = true;
+            productPickerCursor = 0;
+          },
+        },
+        ...itemFields,
         {
           key: "descripcion",
           label: "Descripción",
-          value: () => draft.itemPendiente.descripcion,
-          setValue: (v) => (draft.itemPendiente.descripcion = v),
+          value: () => target.descripcion,
+          setValue: (v) => (target.descripcion = v),
         },
         {
           key: "cantidad",
           label: "Cantidad",
-          value: () => String(draft.itemPendiente.cantidad),
-          setValue: (v) => (draft.itemPendiente.cantidad = Number.parseFloat(v) || 0),
+          value: () => String(target.cantidad),
+          setValue: (v) => (target.cantidad = Number.parseFloat(v) || 0),
         },
         {
           key: "precio",
           label: "Precio unitario",
-          value: () => String(draft.itemPendiente.precioUnitario),
-          setValue: (v) => (draft.itemPendiente.precioUnitario = Number.parseFloat(v) || 0),
+          value: () => String(target.precioUnitario),
+          setValue: (v) => (target.precioUnitario = Number.parseFloat(v) || 0),
         },
         {
           key: "iva",
           label: "Alicuota IVA %",
-          value: () => String(draft.itemPendiente.alicuotaIva),
-          setValue: (v) => (draft.itemPendiente.alicuotaIva = Number.parseFloat(v) || 0),
+          value: () => String(target.alicuotaIva),
+          setValue: (v) => (target.alicuotaIva = Number.parseFloat(v) || 0),
         },
         {
           key: "add",
@@ -212,7 +298,7 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         },
         {
           key: "next",
-          label: "Vista previa y emitir",
+          label: "Ver vista previa",
           value: () => "",
           action: () => {
             step = "confirmar";
@@ -222,17 +308,19 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       ];
     }
 
-    return [
-      {
-        key: "emitir",
-        label: "Emitir factura",
-        value: () => "",
-        action: async () => {
+    if (step === "confirmar") {
+      return [
+        {
+          key: "emitir",
+          label: "Confirmar y emitir",
+          value: () => "",
+          action: async () => {
           loading = true;
           render();
           try {
             const created = await client.crearFacturaDesdeDraft(draft);
-            setStatus(`Factura ${created.numero} emitida correctamente.`);
+            facturaRecienEmitida = created;
+            setStatus(`Factura ${created.numero} emitida correctamente. [e] Enviar por mail`);
             draft = createEmptyDraft();
             step = "cliente";
             view = "inicio";
@@ -242,13 +330,39 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           } finally {
             loading = false;
           }
+          },
         },
-      },
-    ];
+        {
+          key: "volver",
+          label: "Volver atrás",
+          value: () => "",
+          action: () => {
+            step = "detalle";
+            cursor = 0;
+          },
+        },
+      ];
+    }
+
+    return [];
   }
 
   function setStatus(message: string) {
     status.content = `› ${message}`;
+  }
+
+  async function loadPosicionFiscal() {
+    loadingPosicion = true;
+    posicionFiscal = null;
+    render();
+    try {
+      posicionFiscal = await client.obtenerPosicionFiscal();
+    } catch {
+      posicionFiscal = null;
+    } finally {
+      loadingPosicion = false;
+      render();
+    }
   }
 
   async function loadFacturaDetalle() {
@@ -284,8 +398,16 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
   function renderInicio() {
     title.content = "╭─ SOS CONTADOR TERMINAL ───────────────────────────────────────────────────╮";
-    helper.content = "↑/↓ mover • Enter seleccionar • q salir";
+    helper.content = facturaRecienEmitida
+      ? "↑/↓ mover • Enter seleccionar • e enviar factura por mail • q salir"
+      : "↑/↓ mover • Enter seleccionar • q salir";
     const chunks: TextChunk[] = [];
+    if (facturaRecienEmitida) {
+      chunks.push(fg("#2dd4bf")("✓ Factura "));
+      chunks.push(fg("#e6edf3")(`${facturaRecienEmitida.numero}`));
+      chunks.push(fg("#2dd4bf")(" emitida. "));
+      chunks.push(fg("#8b949e")("[e] Enviar por mail\n\n"));
+    }
     inicioMenu.forEach((item, i) => {
       const isSelected = cursor === i;
       chunks.push(isSelected ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
@@ -296,16 +418,36 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
   }
 
   function renderFacturas() {
-    title.content = "╭─ FACTURA (consulta) ──────────────────────────────────────────────────────╮";
-    helper.content = "↑/↓ cambiar factura • Esc volver";
+    title.content = "╭─ LISTADO DE FACTURAS ───────────────────────────────────────────────────╮";
+    helper.content = "↑/↓ mover • Enter ver detalle • Esc volver";
     if (!facturas.length) {
       body.content = "No hay facturas cargadas. Usa 'Sincronizar datos' en inicio.";
       return;
     }
 
+    const chunks: TextChunk[] = [];
+    chunks.push(fg("#2dd4bf")("Seleccioná una factura para ver el detalle:\n\n"));
+    facturas.forEach((f, i) => {
+      const sel = i === invoiceCursor;
+      const color = sel ? fg("#e6edf3") : fg("#8b949e");
+      chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
+      chunks.push(color(`${f.numero.padEnd(14)} ${f.fechaEmision}  ${f.cliente.razonSocial.slice(0, 35).padEnd(35)} $${formatMonto(f.total)}\n`));
+    });
+    chunks.push(fg("#8b949e")("\n"));
+    chunks.push(fg("#8b949e")(`${invoiceCursor + 1} de ${facturas.length}`));
+    body.content = new StyledText(chunks);
+  }
+
+  function renderFacturaDetalle() {
     const f = facturaDetalle ?? selectedFactura();
-    if (loadingDetalle || !f) {
-      body.content = loadingDetalle ? "Cargando detalle de la factura..." : "Seleccionando factura...";
+    title.content = "╭─ DETALLE DE FACTURA ────────────────────────────────────────────────────╮";
+    helper.content = "r Repetir • e Enviar por mail • Esc volver al listado";
+    if (!f) {
+      body.content = "No hay factura seleccionada.";
+      return;
+    }
+    if (loadingDetalle) {
+      body.content = "Cargando detalle...";
       return;
     }
 
@@ -316,7 +458,14 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     chunks.push(fg("#2dd4bf")("FACTURA\n\n"));
     chunks.push(fg("#e6edf3")(`Nº ${f.numero}`));
     chunks.push(fg("#8b949e")("  ".repeat(20)));
-    chunks.push(fg("#e6edf3")(`Fecha de emisión: ${f.fechaEmision}\n\n`));
+    chunks.push(fg("#e6edf3")(`Fecha de emisión: ${f.fechaEmision}\n`));
+    if (f.caeNumero || f.caeVencimiento) {
+      chunks.push(fg("#2dd4bf")("CAE: "));
+      chunks.push(fg("#e6edf3")(`${f.caeNumero ?? "-"}`));
+      if (f.caeVencimiento) chunks.push(fg("#8b949e")(`  Vencimiento: ${f.caeVencimiento}`));
+      chunks.push(fg("#e6edf3")("\n"));
+    }
+    chunks.push(fg("#8b949e")("\n"));
 
     chunks.push(fg("#2dd4bf")("CLIENTE\n"));
     chunks.push(fg("#e6edf3")(`Razón social: ${f.cliente.razonSocial}\n`));
@@ -327,31 +476,84 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
     chunks.push(fg("#2dd4bf")("DETALLE\n"));
     chunks.push(fg("#8b949e")(`${sep}\n`));
-    chunks.push(fg("#8b949e")("Descripción".padEnd(32) + "Cant.".padStart(8) + "P.Unit".padStart(12) + "IVA%".padStart(6) + "Subtotal".padStart(12) + "\n"));
+    chunks.push(fg("#8b949e")("Descripción".padEnd(32) + "Cant.".padStart(10) + "P.Unit".padStart(14) + "IVA%".padStart(6) + "Subtotal".padStart(14) + "\n"));
     chunks.push(fg("#8b949e")(`${sep2}\n`));
 
     f.items.forEach((it) => {
       const neto = it.cantidad * it.precioUnitario;
       const totalLinea = neto * (1 + (it.alicuotaIva || 0) / 100);
       const desc = (it.descripcion || "(sin descripción)").slice(0, 30).padEnd(32);
-      const cant = it.cantidad.toFixed(2).padStart(8);
-      const pUnit = it.precioUnitario.toFixed(2).padStart(12);
-      const iva = (it.alicuotaIva ?? 21).toFixed(0).padStart(6);
-      const sub = (Number.isNaN(totalLinea) ? 0 : totalLinea).toFixed(2).padStart(12);
-      chunks.push(fg("#e6edf3")(`${desc}${cant}${pUnit}${iva}${sub}\n`));
+      chunks.push(fg("#e6edf3")(`${desc}${formatMontoPad(it.cantidad, 10)}${formatMontoPad(it.precioUnitario, 14)}${String(it.alicuotaIva ?? 21).padStart(6)}${formatMontoPad(Number.isNaN(totalLinea) ? 0 : totalLinea, 14)}\n`));
     });
 
     chunks.push(fg("#8b949e")(`${sep2}\n`));
-    chunks.push(fg("#e6edf3")(`Subtotal neto:`.padEnd(58) + f.subtotal.toFixed(2).padStart(12) + "\n"));
-    chunks.push(fg("#e6edf3")(`IVA:`.padEnd(58) + f.totalIva.toFixed(2).padStart(12) + "\n"));
-    chunks.push(fg("#2dd4bf")(`TOTAL:`.padEnd(58) + f.total.toFixed(2).padStart(12) + "\n"));
+    chunks.push(fg("#e6edf3")(`Subtotal neto:`.padEnd(58) + formatMontoPad(f.subtotal, 14) + "\n"));
+    chunks.push(fg("#e6edf3")(`IVA:`.padEnd(58) + formatMontoPad(f.totalIva, 14) + "\n"));
+    chunks.push(fg("#2dd4bf")(`TOTAL:`.padEnd(58) + formatMontoPad(f.total, 14) + "\n"));
 
     if (f.observaciones) {
       chunks.push(fg("#8b949e")("\nObservaciones: "));
       chunks.push(fg("#e6edf3")(`${f.observaciones}\n`));
     }
 
-    chunks.push(fg("#8b949e")(`\nFactura ${invoiceCursor + 1} de ${facturas.length}`));
+    chunks.push(fg("#2dd4bf")("\n[r] Repetir factura  [e] Enviar por mail"));
+    if (emailEnviando) chunks.push(fg("#8b949e")("  (enviando...)"));
+
+    body.content = new StyledText(chunks);
+  }
+
+  function renderPosicionFiscal() {
+    title.content = "╭─ RESUMEN DE POSICIÓN FISCAL ────────────────────────────────────────────╮";
+    helper.content = "Esc volver";
+    if (loadingPosicion) {
+      body.content = "Cargando posición fiscal...";
+      return;
+    }
+    if (!posicionFiscal) {
+      body.content =
+        "No se pudo obtener el resumen. La API de SOS Contador puede no exponer este endpoint (cuit/parametros).\n\nVerificá la documentación de SOS Contador para el endpoint correcto.";
+      return;
+    }
+
+    const p = posicionFiscal;
+    const fmt = (n?: number) => (n != null ? n.toLocaleString("es-AR", { minimumFractionDigits: 2 }) : "-");
+    const chunks: TextChunk[] = [];
+    chunks.push(fg("#2dd4bf")("Últimos 365 días\n\n"));
+    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
+    chunks.push(fg("#2dd4bf")("Ventas y ND: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.ventasYND)}\n`));
+    chunks.push(fg("#2dd4bf")("Notas de Crédito: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.notasCredito)}\n`));
+    chunks.push(fg("#2dd4bf")("Total ventas: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.totalVentas)}\n`));
+    chunks.push(fg("#2dd4bf")("Compras: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.compras)}\n`));
+    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
+    chunks.push(fg("#2dd4bf")("Tope Cat. D (S): "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.topeCatD)}\n`));
+    chunks.push(fg("#2dd4bf")("Consumido %: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.consumidoCatD)}%\n`));
+    chunks.push(fg("#2dd4bf")("Remanente facturable: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.remanenteFacturable)}\n`));
+    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
+    chunks.push(fg("#2dd4bf")("Tope Máximo Serv (K): "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.topeMaxServK)}\n`));
+    chunks.push(fg("#2dd4bf")("Consumido %: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.consumidoMaxServK)}%\n`));
+    chunks.push(fg("#2dd4bf")("Remanente para RINS: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.remanenteRINS)}\n`));
+    chunks.push(fg("#8b949e")("────────────────────────────────────────────────────────────────\n"));
+    chunks.push(fg("#2dd4bf")("% Compras + Gastos s/Tope (40% Cat.K): "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.pctComprasGastos)}%\n`));
+    chunks.push(fg("#2dd4bf")("Remanente compras + gastos: "));
+    chunks.push(fg("#e6edf3")(`${fmt(p.remanenteComprasGastos)}\n`));
+
+    if (p.raw && Object.keys(p.raw).length > 0 && !p.ventasYND && !p.topeCatD) {
+      chunks.push(fg("#8b949e")("\n(Datos crudos de la API - estructura puede variar)\n"));
+      for (const [k, v] of Object.entries(p.raw).slice(0, 15)) {
+        if (v != null && typeof v !== "object") chunks.push(fg("#8b949e")(`  ${k}: ${String(v)}\n`));
+      }
+    }
 
     body.content = new StyledText(chunks);
   }
@@ -360,10 +562,52 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     const fields = getFields();
     const totals = calcularTotales(draft);
 
+    if (step === "confirmar") {
+      title.content = "╭─ VISTA PREVIA ─ Confirmar y emitir ────────────────────────────────────────╮";
+      helper.content = "↑/↓ mover • Enter confirmar y emitir • Esc volver atrás";
+      const sep = "────────────────────────────────────────────────────────────────";
+      const chunks: TextChunk[] = [];
+      chunks.push(fg("#2dd4bf")("FACTURA (borrador)\n\n"));
+      chunks.push(fg("#e6edf3")(`Fecha: ${draft.fechaEmision}\n\n`));
+      chunks.push(fg("#2dd4bf")("CLIENTE\n"));
+      chunks.push(fg("#e6edf3")(`Razón social: ${draft.cliente.razonSocial}\n`));
+      chunks.push(fg("#e6edf3")(`CUIT: ${draft.cliente.cuit}\n`));
+      if (draft.cliente.email) chunks.push(fg("#e6edf3")(`Email: ${draft.cliente.email}\n`));
+      chunks.push(fg("#8b949e")("\n"));
+      chunks.push(fg("#2dd4bf")("DETALLE\n"));
+      chunks.push(fg("#8b949e")(`${sep}\n`));
+      chunks.push(fg("#8b949e")("Descripción".padEnd(32) + "Cant.".padStart(10) + "P.Unit".padStart(14) + "IVA%".padStart(6) + "Subtotal".padStart(14) + "\n"));
+      chunks.push(fg("#8b949e")(`${sep}\n`));
+      draft.items.forEach((it) => {
+        const neto = it.cantidad * it.precioUnitario;
+        const totalLinea = neto * (1 + (it.alicuotaIva || 0) / 100);
+        const desc = (it.descripcion || "(sin descripción)").slice(0, 30).padEnd(32);
+        chunks.push(fg("#e6edf3")(`${desc}${formatMontoPad(it.cantidad, 10)}${formatMontoPad(it.precioUnitario, 14)}${String(it.alicuotaIva ?? 21).padStart(6)}${formatMontoPad(Number.isNaN(totalLinea) ? 0 : totalLinea, 14)}\n`));
+      });
+      chunks.push(fg("#8b949e")(`${sep}\n`));
+      chunks.push(fg("#e6edf3")(`Subtotal neto:`.padEnd(58) + formatMontoPad(totals.subtotal, 14) + "\n"));
+      chunks.push(fg("#e6edf3")(`IVA:`.padEnd(58) + formatMontoPad(totals.totalIva, 14) + "\n"));
+      chunks.push(fg("#2dd4bf")(`TOTAL:`.padEnd(58) + formatMontoPad(totals.total, 14) + "\n"));
+      if (draft.observaciones) chunks.push(fg("#8b949e")("\nObservaciones: "), fg("#e6edf3")(`${draft.observaciones}\n`));
+      const confFields = getFields();
+      const confCursor = Math.min(cursor, confFields.length - 1);
+      chunks.push(fg("#8b949e")("\n"));
+      confFields.forEach((cf, i) => {
+        const sel = i === confCursor;
+        chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
+        chunks.push(sel ? fg("#e6edf3")(cf.label) : fg("#8b949e")(cf.label));
+        chunks.push(fg("#8b949e")("\n"));
+      });
+      body.content = new StyledText(chunks);
+      return;
+    }
+
     title.content = `╭─ NUEVA FACTURA (${step.toUpperCase()}) ───────────────────────────────────────────╮`;
     helper.content = clientPickerActive
       ? "↑/↓ elegir cliente • Enter seleccionar • Esc cancelar"
-      : "↑/↓ mover • Enter editar/accionar • Esc atrás • Tab sugerencias cliente";
+      : productPickerActive
+        ? "↑/↓ elegir producto • Enter agregar • Esc cancelar"
+        : "↑/↓ mover • Enter editar/accionar • Esc atrás • Tab sugerencias cliente";
 
     const chunks: TextChunk[] = [];
     fields.forEach((f, i) => {
@@ -385,6 +629,14 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
         chunks.push(sel ? fg("#e6edf3")(`${c.cuit} | ${c.razonSocial}\n`) : fg("#8b949e")(`${c.cuit} | ${c.razonSocial}\n`));
       });
+    } else if (step === "items" && productPickerActive) {
+      chunks.push(fg("#2dd4bf")("\n▼ Seleccioná un producto (↑/↓ Enter para agregar, Esc cancelar):\n"));
+      productos.slice(0, 12).forEach((p, i) => {
+        const sel = i === productPickerCursor;
+        const color = sel ? fg("#e6edf3") : fg("#8b949e");
+        chunks.push(sel ? fg("#2dd4bf")("❯ ") : fg("#8b949e")("  "));
+        chunks.push(color(`${(p.descripcion || p.codigo || "").slice(0, 35).padEnd(35)} $${formatMonto(p.precioUnitario)} IVA ${p.alicuotaIva}%\n`));
+      });
     } else if (step === "cliente" && draft.cliente.cuit) {
       const sugerencias = clientSuggestions(draft.cliente.cuit);
       if (sugerencias.length) {
@@ -395,16 +647,27 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
 
     chunks.push(
       fg("#8b949e")("\n"),
-      fg("#e6edf3")(`Subtotal: ${totals.subtotal.toFixed(2)}  IVA: ${totals.totalIva.toFixed(2)}  Total: ${totals.total.toFixed(2)}`),
+      fg("#e6edf3")(`Subtotal: ${formatMonto(totals.subtotal)}  IVA: ${formatMonto(totals.totalIva)}  Total: ${formatMonto(totals.total)}`),
     );
 
     if (step === "items" && draft.items.length) {
       chunks.push(fg("#8b949e")("\n\nItems actuales:\n"));
       draft.items.forEach((it, index) => {
-        chunks.push(fg("#e6edf3")(`  ${index + 1}. ${it.descripcion} | ${it.cantidad} x ${it.precioUnitario}\n`));
+        chunks.push(fg("#e6edf3")(`  ${index + 1}. ${it.descripcion} | ${formatMonto(it.cantidad)} x ${formatMonto(it.precioUnitario)}\n`));
       });
     }
 
+    body.content = new StyledText(chunks);
+  }
+
+  function renderEmailInput() {
+    title.content = "╭─ ENVIAR FACTURA POR MAIL ───────────────────────────────────────────────────╮";
+    helper.content = "Ingresá emails separados por coma • Enter enviar • Esc cancelar";
+    const chunks: TextChunk[] = [];
+    chunks.push(fg("#2dd4bf")("Emails (separados por coma):\n\n"));
+    chunks.push(fg("#e6edf3")(emailInputValue || "(vacío)"));
+    chunks.push(fg("#8b949e")("▌"));
+    if (emailEnviando) chunks.push(fg("#8b949e")("\n\nEnviando..."));
     body.content = new StyledText(chunks);
   }
 
@@ -416,8 +679,15 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
       return;
     }
 
+    if (emailInputActive) {
+      renderEmailInput();
+      return;
+    }
+
     if (view === "inicio") renderInicio();
     if (view === "facturas") renderFacturas();
+    if (view === "facturaDetalle") renderFacturaDetalle();
+    if (view === "posicionFiscal") renderPosicionFiscal();
     if (view === "nueva") renderNueva();
   }
 
@@ -434,6 +704,18 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
     }
 
     if (view === "inicio") {
+      if (key.name === "e" && facturaRecienEmitida) {
+        const f = facturaRecienEmitida;
+        if (f.cliente.id) {
+          emailInputActive = true;
+          emailInputValue = f.cliente.email ?? process.env.SOS_CONTADOR_EMAIL ?? "";
+          emailInputContext = { factura: f, source: "inicio" };
+        } else {
+          setStatus("El cliente no tiene ID para enviar.");
+        }
+        render();
+        return;
+      }
       if (key.name === "down") cursor = (cursor + 1) % inicioMenu.length;
       if (key.name === "up") cursor = (cursor - 1 + inicioMenu.length) % inicioMenu.length;
       if (key.name === "enter" || key.name === "return") {
@@ -447,7 +729,9 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
           view = "facturas";
           invoiceCursor = 0;
           facturaDetalle = null;
-          void loadFacturaDetalle();
+        } else if (selected === "Resumen posición fiscal") {
+          view = "posicionFiscal";
+          void loadPosicionFiscal();
         } else if (selected === "Sincronizar datos") {
           await syncData();
         } else {
@@ -464,10 +748,91 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         cursor = 0;
       } else if (key.name === "down" && facturas.length) {
         invoiceCursor = (invoiceCursor + 1) % facturas.length;
-        void loadFacturaDetalle();
       } else if (key.name === "up" && facturas.length) {
         invoiceCursor = (invoiceCursor - 1 + facturas.length) % facturas.length;
+      } else if ((key.name === "enter" || key.name === "return") && facturas.length) {
+        facturaDetalle = null;
+        loadingDetalle = true;
+        view = "facturaDetalle";
         void loadFacturaDetalle();
+      }
+      render();
+      return;
+    }
+
+    if (emailInputActive) {
+      if (key.name === "escape") {
+        emailInputActive = false;
+        emailInputContext = null;
+      } else if (key.name === "enter" || key.name === "return") {
+        const ctx = emailInputContext;
+        if (!ctx) return;
+        const emails = emailInputValue
+          .split(",")
+          .map((e) => e.trim().toLowerCase())
+          .filter((e) => e.length > 0 && e.includes("@"));
+        if (emails.length === 0) {
+          setStatus("Ingresá al menos un email válido.");
+        } else if (!ctx.factura.cliente.id) {
+          setStatus("El cliente no tiene ID. No se puede enviar.");
+        } else {
+          emailEnviando = true;
+          render();
+          try {
+            for (const email of emails) {
+              await client.enviarFacturaPorEmail(ctx.factura.id, ctx.factura.cliente.id, email);
+            }
+            setStatus(`Factura enviada a ${emails.join(", ")}`);
+            if (ctx.source === "inicio") facturaRecienEmitida = null;
+            emailInputActive = false;
+            emailInputContext = null;
+          } catch (err) {
+            setStatus(err instanceof SosContadorClientError ? err.message : "Error al enviar email.");
+          } finally {
+            emailEnviando = false;
+          }
+        }
+      } else if (key.name === "backspace") {
+        emailInputValue = emailInputValue.slice(0, -1);
+      } else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
+        emailInputValue += key.sequence;
+      }
+      render();
+      return;
+    }
+
+    if (view === "facturaDetalle") {
+      if (key.name === "escape") {
+        view = "facturas";
+        facturaDetalle = null;
+      } else if (key.name === "r") {
+        const f = facturaDetalle ?? selectedFactura();
+        if (f) {
+          draft = draftFromFactura(f);
+          view = "nueva";
+          step = "items";
+          cursor = 0;
+          itemEditIndex = null;
+          setStatus("Factura cargada para repetir. Editá ítems con Enter, luego emití.");
+        }
+      } else if (key.name === "e") {
+        const f = facturaDetalle ?? selectedFactura();
+        if (f && f.cliente.id) {
+          emailInputActive = true;
+          emailInputValue = f.cliente.email ?? process.env.SOS_CONTADOR_EMAIL ?? "";
+          emailInputContext = { factura: f, source: "detalle" };
+        } else {
+          setStatus("El cliente debe tener ID para enviar.");
+        }
+      }
+      render();
+      return;
+    }
+
+    if (view === "posicionFiscal") {
+      if (key.name === "escape") {
+        view = "inicio";
+        cursor = 0;
       }
       render();
       return;
@@ -484,6 +849,29 @@ export function createAppScreen(ctx: RenderContext): BoxRenderable {
         draft.cliente = { ...clientes[clientPickerCursor]! };
         clientPickerActive = false;
         setStatus(`Cliente seleccionado: ${draft.cliente.razonSocial}`);
+      }
+      render();
+      return;
+    }
+
+    if (productPickerActive && step === "items") {
+      if (key.name === "escape") {
+        productPickerActive = false;
+      } else if (key.name === "down" && productos.length) {
+        productPickerCursor = (productPickerCursor + 1) % Math.min(productos.length, 12);
+      } else if (key.name === "up" && productos.length) {
+        productPickerCursor = (productPickerCursor - 1 + Math.min(productos.length, 12)) % Math.min(productos.length, 12);
+      } else if ((key.name === "enter" || key.name === "return") && productos[productPickerCursor]) {
+        const p = productos[productPickerCursor]!;
+        draft.items.push({
+          descripcion: p.descripcion,
+          cantidad: 1,
+          precioUnitario: p.precioUnitario,
+          alicuotaIva: p.alicuotaIva,
+        });
+        draft.itemPendiente = { descripcion: "", cantidad: 1, precioUnitario: 0, alicuotaIva: 21 };
+        productPickerActive = false;
+        setStatus(`Producto agregado: ${p.descripcion}`);
       }
       render();
       return;

@@ -1,4 +1,5 @@
-import type { Cliente, Factura } from "../types";
+import { appendFileSync } from "node:fs";
+import type { Cliente, Factura, Producto, PosicionFiscal } from "../types";
 import type { FacturaDraft } from "../ui/state/invoice-draft";
 
 interface AuthPayload {
@@ -24,6 +25,31 @@ function unwrapArray<T>(response: unknown): T[] {
   return [];
 }
 
+function mapParametrosToPosicionFiscal(p: Record<string, unknown>): PosicionFiscal {
+  const getNum = (key: string) => {
+    const v = p[key];
+    if (typeof v === "number" && !Number.isNaN(v)) return v;
+    if (typeof v === "string") return Number.parseFloat(v) || undefined;
+    return undefined;
+  };
+  const result: PosicionFiscal = {
+    ventasYND: getNum("ventas") ?? getNum("ventas_y_nd") ?? getNum("ventasYND"),
+    notasCredito: getNum("notas_credito") ?? getNum("notasCredito"),
+    totalVentas: getNum("total_ventas") ?? getNum("totalVentas"),
+    compras: getNum("compras"),
+    topeCatD: getNum("tope_cat_d") ?? getNum("topeCatD"),
+    consumidoCatD: getNum("consumido_cat_d") ?? getNum("consumidoCatD"),
+    remanenteFacturable: getNum("remanente_facturable") ?? getNum("remanenteFacturable"),
+    topeMaxServK: getNum("tope_max_serv_k") ?? getNum("topeMaxServK"),
+    consumidoMaxServK: getNum("consumido_max_serv_k") ?? getNum("consumidoMaxServK"),
+    remanenteRINS: getNum("remanente_rins") ?? getNum("remanenteRINS"),
+    pctComprasGastos: getNum("pct_compras_gastos") ?? getNum("pctComprasGastos"),
+    remanenteComprasGastos: getNum("remanente_compras_gastos") ?? getNum("remanenteComprasGastos"),
+    raw: p as Record<string, unknown>,
+  };
+  return result;
+}
+
 function mapVentaToFactura(v: Record<string, unknown>): Factura {
   const cab = (v.cabecera ?? v) as Record<string, unknown>;
   const id = String(cab.id ?? v.id ?? cab.idcomprobante ?? "");
@@ -32,6 +58,9 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
   const numero = pv && num ? `${pv.padStart(3, "0")}-${num.padStart(8, "0")}` : String(v.numero ?? num ? num : id);
   const fechaRaw = cab.fecha ?? v.fecha ?? cab.fecha_emision ?? "";
   const fechaEmision = typeof fechaRaw === "string" ? fechaRaw.slice(0, 10) : String(fechaRaw);
+
+  const caeNumero = cab.caenumero != null ? String(cab.caenumero) : undefined;
+  const caeVencimiento = cab.caevencimiento != null ? String(cab.caevencimiento) : undefined;
 
   const clienteRaw = (cab.cliente ?? cab) as Record<string, unknown>;
   const cliente = {
@@ -60,7 +89,19 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
   const imputaciones = (v.imputaciones ?? []) as Array<Record<string, unknown>>;
   let subtotal = Number(v.subtotal ?? v.neto ?? cab.subtotal ?? 0);
   let totalIva = Number(v.total_iva ?? v.iva ?? cab.iva ?? 0);
-  let total = Number(v.total ?? v.importe ?? cab.total ?? 0);
+  let total = Number(
+    v.total ??
+      v.importe ??
+      v.montototal ??
+      v.monto ??
+      v.valor ??
+      v.total_comprobante ??
+      cab.total ??
+      cab.importe ??
+      cab.monto ??
+      cab.montototal ??
+      0,
+  );
   if (total === 0 && imputaciones.length > 0) {
     total = imputaciones.reduce((sum, i) => sum + Number(i.montohaber ?? i.montodebe ?? i.v ?? 0), 0);
   }
@@ -68,6 +109,22 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
     subtotal = items.reduce((s, it) => s + it.cantidad * it.precioUnitario, 0);
     totalIva = items.reduce((s, it) => s + it.cantidad * it.precioUnitario * ((it.alicuotaIva || 0) / 100), 0);
     if (total === 0) total = subtotal + totalIva;
+  }
+  if (total === 0) {
+    for (const [k, val] of Object.entries(v)) {
+      if (typeof val === "number" && val > 0 && (k.toLowerCase().includes("total") || k.toLowerCase().includes("importe") || k.toLowerCase().includes("monto"))) {
+        total = val;
+        break;
+      }
+    }
+    if (total === 0 && typeof cab === "object" && cab !== v) {
+      for (const [k, val] of Object.entries(cab)) {
+        if (typeof val === "number" && val > 0 && (k.toLowerCase().includes("total") || k.toLowerCase().includes("importe") || k.toLowerCase().includes("monto"))) {
+          total = val;
+          break;
+        }
+      }
+    }
   }
   return {
     id,
@@ -79,6 +136,8 @@ function mapVentaToFactura(v: Record<string, unknown>): Factura {
     totalIva,
     total,
     estado: "emitida",
+    caeNumero,
+    caeVencimiento,
   };
 }
 
@@ -211,6 +270,50 @@ export class SosContadorClient {
     }));
   }
 
+  async listarProductos(pagina = 1, registros = 100): Promise<Producto[]> {
+    if (!this.baseUrl) return [];
+    const params = new URLSearchParams({
+      pagina: String(pagina),
+      registros: String(registros),
+    });
+    const resp = await this.request<unknown>(`/producto/listado?${params}`, { method: "GET" });
+    const raw = unwrapArray<Record<string, unknown>>(resp);
+    return raw.map((p) => ({
+      id: String(p.id ?? p.idproducto ?? ""),
+      codigo: p.codigo != null ? String(p.codigo) : undefined,
+      descripcion: String(p.producto ?? p.descripcion ?? p.nombre ?? ""),
+      precioUnitario: Number(p.precio ?? p.unitario ?? p.precio_unitario ?? 0),
+      alicuotaIva: Number(p.alicuota ?? p.alicuota_iva ?? 21),
+    }));
+  }
+
+  async enviarFacturaPorEmail(comprobanteId: string, idcliente: string, email: string): Promise<{ ok: boolean; response?: unknown }> {
+    if (!this.baseUrl) throw new SosContadorClientError("SOS_CONTADOR_BASE_URL no está configurado.");
+    const body = { comprobantes: [comprobanteId], idcliente, email };
+    const log = (msg: string) => {
+      if (process.env.DEBUG_EMAIL === "1") {
+        appendFileSync("debug-email.log", `${new Date().toISOString()}\n${msg}\n\n`);
+      }
+    };
+    log(`POST /email/enviar\n${JSON.stringify(body, null, 2)}`);
+    const response = await this.request<unknown>("/email/enviar", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    log(`Response:\n${JSON.stringify(response, null, 2)}`);
+    return { ok: true, response };
+  }
+
+  async obtenerPosicionFiscal(): Promise<PosicionFiscal | null> {
+    if (!this.baseUrl) return null;
+    try {
+      const resp = await this.request<Record<string, unknown>>("/cuit/parametros", { method: "GET" });
+      return mapParametrosToPosicionFiscal(resp);
+    } catch {
+      return null;
+    }
+  }
+
   async buscarClientePorCuit(cuit: string): Promise<Cliente | null> {
     if (!cuit.trim()) return null;
     const clientes = await this.listarClientes();
@@ -224,7 +327,7 @@ export class SosContadorClient {
 
     const idPath = draft.idOrigen ? `/${draft.idOrigen}` : "";
 
-    return this.request<Factura>(`/venta${idPath}`, {
+    const resp = await this.request<Record<string, unknown>>(`/venta${idPath}`, {
       method: "PUT",
       body: JSON.stringify({
         fecha: draft.fechaEmision,
@@ -249,6 +352,10 @@ export class SosContadorClient {
         })),
       }),
     });
+    const factura = mapVentaToFactura(resp);
+    if (!factura.cliente.id && draft.cliente.id) factura.cliente.id = draft.cliente.id;
+    if (!factura.cliente.email && draft.cliente.email) factura.cliente.email = draft.cliente.email;
+    return factura;
   }
 
   private async request<T>(
